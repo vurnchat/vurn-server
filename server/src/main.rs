@@ -27,10 +27,24 @@
 //! The server:
 //! 1. Parses the recipient ID from the frame.
 //! 2. Looks up the recipient's open WebSocket connection.
-//! 3. Forwards the encrypted payload with the sender's ID:
+//! 3. If connected: forwards the encrypted payload with the sender's ID:
 //!    `[sender_id_len (u16 LE)][sender_id bytes][encrypted payload]`
+//! 4. If offline: stores the forward frame in the recipient's cryptographic
+//!    mailbox (in-memory, zero-knowledge — the server never sees plaintext).
 //!
-//! If the recipient is not connected, the server sends back an error frame:
+//! ### Mailbox delivery (offline messages)
+//! When a client connects, the server delivers all queued mailbox messages
+//! in a single padded blob:
+//! ```text
+//! [0xFE, 0xFE]                                     — mailbox sentinel
+//! [2 bytes: message count (u16 LE)]
+//! [for each message: 2 bytes len (u16 LE)][msg bytes]
+//! [zero-padding to 4096-byte boundary]              — traffic-analysis resistance
+//! ```
+//! Messages are deleted from the mailbox immediately after delivery.
+//!
+//! ### Error
+//! If a message is malformed, the server sends back:
 //!    `[0xFF, 0xFF]` followed by the original recipient ID bytes.
 //!
 //! ### Disconnection
@@ -50,13 +64,25 @@ use std::{collections::HashMap, sync::Arc};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{error, info, warn};
 
-/// Shared application state: maps client ID → channel to send messages to that client.
+/// Chunk size for mailbox delivery padding (traffic-analysis resistance).
+const CHUNK_SIZE: usize = 4096;
+
+// TODO: Add periodic mailbox cleanup (e.g., Tokio interval) to drop messages
+// older than N hours if the recipient never connects. Without TTL, the mailbox
+// grows unboundedly.
+
+/// Shared application state.
 ///
-/// Client IDs are raw bytes (public key hashes). Multiple WebSocket connections may
-/// share the same client ID (e.g. multiple browser tabs).
+/// - `clients`: maps client ID → open WebSocket send channels.
+///   Client IDs are raw bytes (public key hashes). Multiple connections
+///   may share the same client ID (e.g. multiple browser tabs).
+/// - `mailboxes`: maps client ID → queued messages for offline recipients.
+///   Messages are stored as pre-built forward frames (zero-knowledge —
+///   the server never sees plaintext). Delivered and cleared on connect.
 #[derive(Default)]
 struct ConnectionMap {
     clients: HashMap<Vec<u8>, Vec<mpsc::UnboundedSender<Vec<u8>>>>,
+    mailboxes: HashMap<Vec<u8>, Vec<Vec<u8>>>,
 }
 
 type SharedState = Arc<RwLock<ConnectionMap>>;
@@ -154,14 +180,28 @@ async fn handle_connection(socket: WebSocket, state: SharedState) {
 
     // ------ Step 2: Create forwarding channel ------
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let tx_delivery = tx.clone(); // clone before moving into map
 
-    // Register this client's sender in the shared connection map.
+    // Register this client's sender + deliver any stored mailbox messages.
     {
         let mut map = state.write().await;
         map.clients
             .entry(session_id.to_vec())
             .or_default()
             .push(tx);
+
+        // Check for stored offline messages and deliver them immediately.
+        if let Some(messages) = map.mailboxes.remove(session_id.as_ref()) {
+            if !messages.is_empty() {
+                let blob = build_mailbox_delivery(&messages);
+                let _ = tx_delivery.send(blob);
+                info!(
+                    "Mailbox: delivered {} stored messages to {}",
+                    messages.len(),
+                    hex_fmt(&session_id, 8)
+                );
+            }
+        }
     }
 
     // ------ Step 3: Spawn task to forward messages to this client's WebSocket ------
@@ -297,12 +337,37 @@ async fn relay_message(state: &SharedState, sender_id: &[u8], data: &[u8]) {
             send_error(state, sender_id, recipient_id).await;
         }
     } else {
-        warn!(
-            "Recipient not connected: {}",
+        // Recipient not connected — store in their cryptographic mailbox.
+        // The server never sees plaintext; this is just a blind forward frame.
+        info!(
+            "Recipient offline, queued {}b in mailbox: {}",
+            payload.len(),
             hex_fmt(recipient_id, 8)
         );
-        send_error(state, sender_id, recipient_id).await;
+        let mut map = state.write().await;
+        map.mailboxes
+            .entry(recipient_id.to_vec())
+            .or_default()
+            .push(forward);
     }
+}
+
+/// Builds the mailbox delivery blob for one or more stored messages.
+///
+/// Format: `[0xFE, 0xFE][u16 LE: count][for each: u16 LE len][msg bytes]`
+/// Padded to CHUNK_SIZE to mask how many messages were stored (traffic analysis).
+fn build_mailbox_delivery(messages: &[Vec<u8>]) -> Vec<u8> {
+    let mut blob = vec![0xFE, 0xFE];
+    blob.extend_from_slice(&(messages.len() as u16).to_le_bytes());
+    for msg in messages {
+        blob.extend_from_slice(&(msg.len() as u16).to_le_bytes());
+        blob.extend_from_slice(msg);
+    }
+    // Pad to nearest CHUNK_SIZE multiple so an observer cannot infer
+    // the number or size of stored messages from traffic volume.
+    let padded_len = ((blob.len() + CHUNK_SIZE - 1) / CHUNK_SIZE) * CHUNK_SIZE;
+    blob.resize(padded_len, 0);
+    blob
 }
 
 /// Sends a delivery-failure notification back to the sender.
