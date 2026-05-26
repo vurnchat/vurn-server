@@ -1,0 +1,13 @@
+[package]
+name = "vurn-server"
+version = "0.1.0"
+edition = "2021"
+description = "Blind WebSocket relay server for the VurnChat messenger"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+axum = { version = "0.7", features = ["ws"] }
+tokio = { version = "1", features = ["full"] }
+futures-util = "0.3"
+tracing = "0.1"
+tracing-subscriber = "0.3"
