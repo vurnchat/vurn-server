@@ -28,6 +28,7 @@ use ml_kem::{
     EncodedSizeUser, KemCore, MlKem1024, MlKem1024Params,
 };
 use rand::{rngs::OsRng, RngCore};
+use sha2::{Digest, Sha256};
 
 // Type aliases for MlKem1024 parameter set
 type MlKemEncapsKey = EncapsulationKey<MlKem1024Params>;
@@ -143,6 +144,16 @@ impl VurnCipher {
             .map_err(|e| format!("Decryption failed (wrong key or tampered data): {}", e))?;
 
         Ok(plaintext)
+    }
+
+    /// Computes a SHA-256 hash of the public key for use as a short user ID.
+    ///
+    /// This 32-byte hash serves as the user's identity in the network.
+    /// It can be shared with contacts to receive messages.
+    pub fn hash_public_key(public_key: &[u8]) -> Vec<u8> {
+        let mut hasher = Sha256::new();
+        hasher.update(public_key);
+        hasher.finalize().to_vec()
     }
 }
 

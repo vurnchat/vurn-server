@@ -9,5 +9,6 @@ license = "MIT OR Apache-2.0"
 ml-kem = { version = "0.2", features = ["std", "zeroize"] }
 aes-gcm = "0.10"
 rand = { version = "0.8", features = ["getrandom"] }
+sha2 = "0.10"
 
 [dev-dependencies]
