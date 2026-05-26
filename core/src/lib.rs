@@ -195,6 +195,45 @@ impl VurnCipher {
         result
     }
 
+    /// Computes a safety fingerprint for two public keys.
+    ///
+    /// Sorts both keys alphabetically (same order for both parties),
+    /// concatenates them, hashes with SHA-256, and formats as
+    /// 12 groups of 5 decimal digits (like Signal/Threema).
+    ///
+    /// Both parties will compute the same fingerprint if they
+    /// have each other's genuine public keys — MITM detection.
+    pub fn compute_fingerprint(my_pk: &[u8], their_pk: &[u8]) -> String {
+        // Sort so both sides compute the same hash
+        let (first, second) = if my_pk < their_pk {
+            (my_pk, their_pk)
+        } else {
+            (their_pk, my_pk)
+        };
+
+        let mut hasher = Sha256::new();
+        hasher.update(first);
+        hasher.update(second);
+        let hash = hasher.finalize();
+
+        // Convert hash bytes to 12 groups of 5 digits
+        let mut result = String::with_capacity(71); // 12*5 + 11 spaces
+        let mut buf = [0u8; 2];
+        for i in 0..12 {
+            let idx = (i * 2) % 30;
+            // Take 2 bytes, make a u16, mod 100000
+            buf[0] = hash[idx];
+            buf[1] = hash[idx + 1];
+            let val = u16::from_be_bytes(buf) as u32 % 100_000;
+            if i > 0 {
+                result.push(' ');
+            }
+            // Pad with leading zeros to 5 digits
+            result.push_str(&format!("{:05}", val));
+        }
+        result
+    }
+
     /// Decrypts data that was encrypted with `encrypt_symmetric`.
     ///
     /// Returns an error if the key is wrong or the data has been tampered with.
@@ -363,5 +402,29 @@ mod tests {
         let encrypted = VurnCipher::encrypt(&pk_a, msg_to_alice).unwrap();
         let decrypted = VurnCipher::decrypt(&sk_a, &encrypted).unwrap();
         assert_eq!(decrypted, msg_to_alice);
+    }
+
+    #[test]
+    fn test_fingerprint() {
+        let (pk_a, _) = VurnCipher::generate_keypair();
+        let (pk_b, _) = VurnCipher::generate_keypair();
+        let (pk_c, _) = VurnCipher::generate_keypair();
+
+        // Both sides compute same fingerprint regardless of order
+        let fp1 = VurnCipher::compute_fingerprint(&pk_a, &pk_b);
+        let fp2 = VurnCipher::compute_fingerprint(&pk_b, &pk_a);
+        assert_eq!(fp1, fp2, "Fingerprint must be order-independent");
+
+        // Different keys produce different fingerprints
+        let fp3 = VurnCipher::compute_fingerprint(&pk_a, &pk_c);
+        assert_ne!(fp1, fp3, "Different keypairs must produce different fingerprints");
+
+        // Format: 12 groups of 5 digits separated by spaces
+        let groups: Vec<&str> = fp1.split(' ').collect();
+        assert_eq!(groups.len(), 12, "Must have 12 digit groups");
+        for g in &groups {
+            assert_eq!(g.len(), 5, "Each group must be 5 digits");
+            assert!(g.chars().all(|c| c.is_ascii_digit()), "Groups must be digits only");
+        }
     }
 }
