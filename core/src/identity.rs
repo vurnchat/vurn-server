@@ -108,6 +108,9 @@ impl BlindProfileManager {
     /// ```
     /// Then base64url-encoded without padding.
     ///
+    /// `base_url` should be the origin of the page (e.g. `https://vurnchat.org`).
+    /// The invite parameter is appended as `?invite=...`.
+    ///
     /// Example output:
     /// ```text
     /// https://vurnchat.org/?invite=ZXhhbXBsZV9kYXRh...
@@ -115,7 +118,7 @@ impl BlindProfileManager {
     ///
     /// This link can be shared in any chat or rendered as a QR code.
     /// Scanning it adds the contact **without any server round-trip**.
-    pub fn generate_invite(session_hash: &[u8], public_key: &[u8]) -> String {
+    pub fn generate_invite(session_hash: &[u8], public_key: &[u8], base_url: &str) -> String {
         let mut data = Vec::with_capacity(4 + session_hash.len() + public_key.len());
         data.extend_from_slice(&(session_hash.len() as u16).to_le_bytes());
         data.extend_from_slice(session_hash);
@@ -123,7 +126,8 @@ impl BlindProfileManager {
         data.extend_from_slice(public_key);
 
         let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&data);
-        format!("https://vurnchat.org/?invite={}", encoded)
+        let base = base_url.trim_end_matches('/');
+        format!("{}/?invite={}", base, encoded)
     }
 
     /// Parses an invite URL back into session hash and public key.
@@ -173,11 +177,12 @@ impl BlindProfileManager {
 
     /// Generates an SVG QR code for the invite URL.
     ///
+    /// `base_url` is passed through to [`generate_invite`](Self::generate_invite).
     /// Returns a complete `<svg>` XML string suitable for direct injection
     /// into HTML. The QR code encodes the invite URL; scanning it extracts
     /// the session hash and public key without any server round-trip.
-    pub fn generate_invite_qr(session_hash: &[u8], public_key: &[u8]) -> Result<String, String> {
-        let invite_url = Self::generate_invite(session_hash, public_key);
+    pub fn generate_invite_qr(session_hash: &[u8], public_key: &[u8], base_url: &str) -> Result<String, String> {
+        let invite_url = Self::generate_invite(session_hash, public_key, base_url);
 
         let code = qrcode::QrCode::new(invite_url.as_bytes())
             .map_err(|e| format!("QR code generation failed: {}", e))?;
@@ -303,9 +308,10 @@ mod tests {
     fn test_invite_roundtrip() {
         let (pk_alice, _) = VurnCipher::generate_keypair();
         let hash_alice = VurnCipher::hash_public_key(&pk_alice);
+        let base = "https://vurnchat.org";
 
         // Generate invite
-        let invite = BlindProfileManager::generate_invite(&hash_alice, &pk_alice);
+        let invite = BlindProfileManager::generate_invite(&hash_alice, &pk_alice, base);
 
         // Must be a valid URL
         assert!(
@@ -326,8 +332,9 @@ mod tests {
     fn test_invite_tampered_fails() {
         let (pk, _) = VurnCipher::generate_keypair();
         let hash = VurnCipher::hash_public_key(&pk);
+        let base = "https://vurnchat.org";
 
-        let invite = BlindProfileManager::generate_invite(&hash, &pk);
+        let invite = BlindProfileManager::generate_invite(&hash, &pk, base);
 
         // Parse original to get reference
         let (orig_hash, orig_pk) =
@@ -370,7 +377,7 @@ mod tests {
         let hash_alice = VurnCipher::hash_public_key(&pk_alice);
 
         // Alice sends invite → Bob receives (no server involved)
-        let invite = BlindProfileManager::generate_invite(&hash_alice, &pk_alice);
+        let invite = BlindProfileManager::generate_invite(&hash_alice, &pk_alice, "https://vurnchat.org");
 
         // Bob gets the invite URL (e.g., scanned from QR or pasted in chat)
         let (received_hash, received_pk) =
@@ -396,7 +403,7 @@ mod tests {
         let (pk, _) = VurnCipher::generate_keypair();
         let hash = VurnCipher::hash_public_key(&pk);
 
-        let svg = BlindProfileManager::generate_invite_qr(&hash, &pk)
+        let svg = BlindProfileManager::generate_invite_qr(&hash, &pk, "https://vurnchat.org")
             .expect("QR generation should succeed");
 
         // Must be valid SVG — qrcode crate may include XML declaration
