@@ -111,6 +111,20 @@ struct StoredMessage {
     data: Vec<u8>,
 }
 
+/// A registered blind profile with ownership information.
+///
+/// The server stores the owner's session ID so only the original registrant
+/// can unregister or update the profile. The server never sees the plaintext
+/// username or public key.
+struct ProfileEntry {
+    /// Session ID (SHA-256 hash of public key) of the registrant.
+    /// Used to authorize unregister and update operations.
+    owner_hash: Vec<u8>,
+    /// The encrypted profile blob (AES-256-GCM of public key).
+    /// The server never decrypts this — it's opaque bytes to us.
+    blob: Vec<u8>,
+}
+
 /// Shared application state.
 ///
 /// - `clients`: maps client ID → open WebSocket send channels.
@@ -120,14 +134,15 @@ struct StoredMessage {
 ///   Each message is timestamped for TTL-based garbage collection.
 ///   Messages are stored as pre-built forward frames (zero-knowledge —
 ///   the server never sees plaintext). Delivered and cleared on connect.
-/// - `blind_profiles`: maps 32-byte HMAC search index → encrypted profile blob.
-///   The server can look up profiles by index but cannot decrypt the blob
-///   or recover the original username from the index.
+/// - `blind_profiles`: maps 32-byte HMAC search index → `ProfileEntry`.
+///   Each entry stores the owner's session ID (for authorization) and the
+///   encrypted profile blob. The server can look up profiles by index but
+///   cannot decrypt the blob or recover the original username from the index.
 #[derive(Default)]
 struct ConnectionMap {
     clients: HashMap<Vec<u8>, Vec<mpsc::UnboundedSender<Vec<u8>>>>,
     mailboxes: HashMap<Vec<u8>, Vec<StoredMessage>>,
-    blind_profiles: HashMap<Vec<u8>, Vec<u8>>,
+    blind_profiles: HashMap<Vec<u8>, ProfileEntry>,
 }
 
 type SharedState = Arc<RwLock<ConnectionMap>>;
@@ -518,14 +533,16 @@ async fn send_error(state: &SharedState, sender_id: &[u8], recipient_id: &[u8]) 
     }
 }
 
-/// Dispatches a profile operation (register or lookup) and sends the
-/// response back to the requesting client.
+/// Dispatches a profile operation and sends the response back.
 ///
 /// `opcode` is the second byte of the frame (`data[1]`):
 /// - `0x01` = RegisterProfile
 /// - `0x02` = LookupProfile
+/// - `0x03` = UnregisterProfile
+/// - `0x04` = UpdateProfile
 ///
 /// `payload` is everything after the 2-byte header.
+/// `client_id` is the requesting client's session ID (used for ownership checks).
 async fn handle_profile_operation(
     state: &SharedState,
     client_id: &[u8],
@@ -533,8 +550,10 @@ async fn handle_profile_operation(
     payload: &[u8],
 ) {
     let response = match opcode {
-        0x01 => handle_register_profile(state, payload).await,
+        0x01 => handle_register_profile(state, client_id, payload).await,
         0x02 => handle_lookup_profile(state, payload).await,
+        0x03 => handle_unregister_profile(state, client_id, payload).await,
+        0x04 => handle_update_profile(state, client_id, payload).await,
         _ => {
             warn!("Unknown profile operation: 0x{:02x}", opcode);
             return;
@@ -557,10 +576,12 @@ async fn handle_profile_operation(
 /// Payload: `[32 bytes: search_index][encrypted profile blob]`
 ///
 /// If the index is already registered, returns `[0xFF, 0x00, 0x01]` (occupied).
-/// On success, stores the blob and returns `[0xFE, 0x00, 0x00]`.
+/// On success, stores the blob with the caller's session ID as owner
+/// and returns `[0xFE, 0x00, 0x00]`.
 /// The server never sees the plaintext username or public key.
 async fn handle_register_profile(
     state: &SharedState,
+    owner_id: &[u8],
     payload: &[u8],
 ) -> Option<Vec<u8>> {
     if payload.len() < 32 {
@@ -580,7 +601,13 @@ async fn handle_register_profile(
             );
             vec![0xFF, 0x00, 0x01] // error: username occupied
         } else {
-            map.blind_profiles.insert(index.clone(), blob);
+            map.blind_profiles.insert(
+                index.clone(),
+                ProfileEntry {
+                    owner_hash: owner_id.to_vec(),
+                    blob,
+                },
+            );
             info!(
                 "RegisterProfile: registered new profile (index={})",
                 hex_fmt(&index, 8)
@@ -612,10 +639,10 @@ async fn handle_lookup_profile(
 
     let response = {
         let map = state.read().await;
-        if let Some(blob) = map.blind_profiles.get(&index) {
+        if let Some(entry) = map.blind_profiles.get(&index) {
             let mut resp = vec![0xFE, 0x01];
-            resp.extend_from_slice(&(blob.len() as u16).to_le_bytes());
-            resp.extend_from_slice(blob);
+            resp.extend_from_slice(&(entry.blob.len() as u16).to_le_bytes());
+            resp.extend_from_slice(&entry.blob);
             info!(
                 "LookupProfile: found profile (index={})",
                 hex_fmt(&index, 8)
@@ -629,6 +656,119 @@ async fn handle_lookup_profile(
             vec![0xFF, 0x01, 0x00] // not found
         }
     }; // read lock released
+
+    Some(response)
+}
+
+/// Handles an `UnregisterProfile` request.
+///
+/// Payload: `[32 bytes: search_index]`
+///
+/// Only the original registrant (owner) can unregister. If the index doesn't
+/// exist or the caller is not the owner, returns `[0xFF, 0x02, 0x00]`.
+/// On success, removes the entry and returns `[0xFE, 0x02, 0x00]`.
+/// The server never knows which username was unregistered.
+async fn handle_unregister_profile(
+    state: &SharedState,
+    caller_id: &[u8],
+    payload: &[u8],
+) -> Option<Vec<u8>> {
+    if payload.len() < 32 {
+        warn!("UnregisterProfile: payload too short ({} bytes)", payload.len());
+        return None;
+    }
+
+    let index = payload[..32].to_vec();
+
+    let response = {
+        let mut map = state.write().await;
+        match map.blind_profiles.get(&index) {
+            Some(entry) if entry.owner_hash == caller_id => {
+                map.blind_profiles.remove(&index);
+                info!(
+                    "UnregisterProfile: removed profile (index={})",
+                    hex_fmt(&index, 8)
+                );
+                vec![0xFE, 0x02, 0x00] // success
+            }
+            Some(_) => {
+                // Index exists but caller is not the owner
+                warn!(
+                    "UnregisterProfile: unauthorized attempt by {} (index={})",
+                    hex_fmt(caller_id, 8),
+                    hex_fmt(&index, 8)
+                );
+                vec![0xFF, 0x02, 0x00] // error: not owner / not found
+            }
+            None => {
+                info!(
+                    "UnregisterProfile: not found (index={})",
+                    hex_fmt(&index, 8)
+                );
+                vec![0xFF, 0x02, 0x00] // error: not owner / not found
+            }
+        }
+    }; // write lock released
+
+    Some(response)
+}
+
+/// Handles an `UpdateProfile` request.
+///
+/// Payload: `[32 bytes: search_index][new encrypted profile blob]`
+///
+/// Only the original registrant (owner) can update. Replaces the encrypted
+/// blob with the new one. This allows changing the public key associated
+/// with a username without needing to unregister and re-register.
+///
+/// On success, returns `[0xFE, 0x03, 0x00]`.
+/// On failure (not found or not owner), returns `[0xFF, 0x03, 0x00]`.
+async fn handle_update_profile(
+    state: &SharedState,
+    caller_id: &[u8],
+    payload: &[u8],
+) -> Option<Vec<u8>> {
+    if payload.len() < 32 {
+        warn!("UpdateProfile: payload too short ({} bytes)", payload.len());
+        return None;
+    }
+
+    let index = payload[..32].to_vec();
+    let new_blob = payload[32..].to_vec();
+
+    if new_blob.is_empty() {
+        warn!("UpdateProfile: empty blob");
+        return None;
+    }
+
+    let response = {
+        let mut map = state.write().await;
+        match map.blind_profiles.get_mut(&index) {
+            Some(entry) if entry.owner_hash == caller_id => {
+                entry.blob = new_blob;
+                info!(
+                    "UpdateProfile: updated blob (index={})",
+                    hex_fmt(&index, 8)
+                );
+                vec![0xFE, 0x03, 0x00] // success
+            }
+            Some(_) => {
+                warn!(
+                    "UpdateProfile: unauthorized attempt by {} (index={})",
+                    hex_fmt(caller_id, 8),
+                    hex_fmt(&index, 8)
+                );
+                vec![0xFF, 0x03, 0x00] // error
+            }
+            None => {
+                info!(
+                    "UpdateProfile: not found (index={})",
+                    hex_fmt(&index, 8)
+                );
+                vec![0xFF, 0x03, 0x00] // error
+            }
+        }
+    }; // write lock released
 
     Some(response)
 }
