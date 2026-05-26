@@ -15,3 +15,6 @@ Thumbs.db
 
 # Cargo lock for libraries (keep for binaries)
 Cargo.lock
+
+# Trunk build artifacts
+web-client/dist/
