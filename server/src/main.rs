@@ -43,6 +43,27 @@
 //! ```
 //! Messages are deleted from the mailbox immediately after delivery.
 //!
+//! ### Profile operations (blind username registration & lookup)
+//! Clients can register a blind profile or look up someone else's profile
+//! using message type discriminators. These operations are completely
+//! separate from message relay — the server stores only HMAC-based
+//! search indices and encrypted blobs, never plaintext usernames or keys.
+//!
+//! Frame type is determined by the first two bytes:
+//! - `[0x00, 0x01]` = **RegisterProfile**: `[index 32B][encrypted blob]`
+//! - `[0x00, 0x02]` = **LookupProfile**: `[index 32B]`
+//!
+//! These frames never conflict with existing relay frames because
+//! relay frames start with `[id_len (u16 LE)]` where the first byte
+//! is the actual length value. For SHA-256 hashes (32 bytes = 0x20),
+//! the first byte is 0x20, never 0x00.
+//!
+//! **Server → Client responses for profile ops:**
+//! - Register success: `[0xFE, 0x00, 0x00]` (3 bytes)
+//! - Register error (occupied): `[0xFF, 0x00, 0x01]` (3 bytes)
+//! - Lookup found: `[0xFE, 0x01][2B blob_len][encrypted blob]`
+//! - Lookup not found: `[0xFF, 0x01, 0x00]` (3 bytes)
+//!
 //! ### Error
 //! If a message is malformed, the server sends back:
 //!    `[0xFF, 0xFF]` followed by the original recipient ID bytes.
@@ -99,10 +120,14 @@ struct StoredMessage {
 ///   Each message is timestamped for TTL-based garbage collection.
 ///   Messages are stored as pre-built forward frames (zero-knowledge —
 ///   the server never sees plaintext). Delivered and cleared on connect.
+/// - `blind_profiles`: maps 32-byte HMAC search index → encrypted profile blob.
+///   The server can look up profiles by index but cannot decrypt the blob
+///   or recover the original username from the index.
 #[derive(Default)]
 struct ConnectionMap {
     clients: HashMap<Vec<u8>, Vec<mpsc::UnboundedSender<Vec<u8>>>>,
     mailboxes: HashMap<Vec<u8>, Vec<StoredMessage>>,
+    blind_profiles: HashMap<Vec<u8>, Vec<u8>>,
 }
 
 type SharedState = Arc<RwLock<ConnectionMap>>;
@@ -259,7 +284,19 @@ async fn handle_connection(socket: WebSocket, state: SharedState) {
     while let Some(msg) = ws_stream.next().await {
         match msg {
             Ok(Message::Binary(data)) => {
-                relay_message(&state, &session_id, &data).await;
+                // Profile operations use [0x00, opcode] as frame prefix.
+                // These never conflict with relay frames (which start with
+                // the first byte of recipient_id_len, never 0x00 for SHA-256).
+                if data.len() >= 2 && data[0] == 0x00 {
+                    handle_profile_operation(
+                        &state,
+                        &session_id,
+                        data[1],
+                        &data[2..],
+                    ).await;
+                } else {
+                    relay_message(&state, &session_id, &data).await;
+                }
             }
             Ok(Message::Close(_)) => break,
             Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {
@@ -479,6 +516,121 @@ async fn send_error(state: &SharedState, sender_id: &[u8], recipient_id: &[u8]) 
             let _ = tx.send(error_frame.clone());
         }
     }
+}
+
+/// Dispatches a profile operation (register or lookup) and sends the
+/// response back to the requesting client.
+///
+/// `opcode` is the second byte of the frame (`data[1]`):
+/// - `0x01` = RegisterProfile
+/// - `0x02` = LookupProfile
+///
+/// `payload` is everything after the 2-byte header.
+async fn handle_profile_operation(
+    state: &SharedState,
+    client_id: &[u8],
+    opcode: u8,
+    payload: &[u8],
+) {
+    let response = match opcode {
+        0x01 => handle_register_profile(state, payload).await,
+        0x02 => handle_lookup_profile(state, payload).await,
+        _ => {
+            warn!("Unknown profile operation: 0x{:02x}", opcode);
+            return;
+        }
+    };
+
+    if let Some(data) = response {
+        // Send response back through the client's WebSocket channel
+        let map = state.read().await;
+        if let Some(senders) = map.clients.get(client_id) {
+            for tx in senders.iter() {
+                let _ = tx.send(data.clone());
+            }
+        }
+    }
+}
+
+/// Handles a `RegisterProfile` request.
+///
+/// Payload: `[32 bytes: search_index][encrypted profile blob]`
+///
+/// If the index is already registered, returns `[0xFF, 0x00, 0x01]` (occupied).
+/// On success, stores the blob and returns `[0xFE, 0x00, 0x00]`.
+/// The server never sees the plaintext username or public key.
+async fn handle_register_profile(
+    state: &SharedState,
+    payload: &[u8],
+) -> Option<Vec<u8>> {
+    if payload.len() < 32 {
+        warn!("RegisterProfile: payload too short ({} bytes)", payload.len());
+        return None;
+    }
+
+    let index = payload[..32].to_vec();
+    let blob = payload[32..].to_vec();
+
+    let response = {
+        let mut map = state.write().await;
+        if map.blind_profiles.contains_key(&index) {
+            info!(
+                "RegisterProfile: username already taken (index={})",
+                hex_fmt(&index, 8)
+            );
+            vec![0xFF, 0x00, 0x01] // error: username occupied
+        } else {
+            map.blind_profiles.insert(index.clone(), blob);
+            info!(
+                "RegisterProfile: registered new profile (index={})",
+                hex_fmt(&index, 8)
+            );
+            vec![0xFE, 0x00, 0x00] // success
+        }
+    }; // write lock released
+
+    Some(response)
+}
+
+/// Handles a `LookupProfile` request.
+///
+/// Payload: `[32 bytes: search_index]`
+///
+/// If the index exists, returns `[0xFE, 0x01][2B blob_len][encrypted blob]`.
+/// If not found, returns `[0xFF, 0x01, 0x00]`.
+/// The server never sees the plaintext username or public key.
+async fn handle_lookup_profile(
+    state: &SharedState,
+    payload: &[u8],
+) -> Option<Vec<u8>> {
+    if payload.len() < 32 {
+        warn!("LookupProfile: payload too short ({} bytes)", payload.len());
+        return None;
+    }
+
+    let index = payload[..32].to_vec();
+
+    let response = {
+        let map = state.read().await;
+        if let Some(blob) = map.blind_profiles.get(&index) {
+            let mut resp = vec![0xFE, 0x01];
+            resp.extend_from_slice(&(blob.len() as u16).to_le_bytes());
+            resp.extend_from_slice(blob);
+            info!(
+                "LookupProfile: found profile (index={})",
+                hex_fmt(&index, 8)
+            );
+            resp
+        } else {
+            info!(
+                "LookupProfile: not found (index={})",
+                hex_fmt(&index, 8)
+            );
+            vec![0xFF, 0x01, 0x00] // not found
+        }
+    }; // read lock released
+
+    Some(response)
 }
 
 /// Periodic background task that scavenges expired mailbox messages.

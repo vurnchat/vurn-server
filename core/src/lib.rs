@@ -19,6 +19,8 @@
 //! [M bytes: AES-GCM encrypted payload + 16-byte authentication tag]
 //! ```
 
+pub mod identity;
+
 use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
