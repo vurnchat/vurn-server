@@ -60,7 +60,7 @@ use axum::{
     Router,
 };
 use futures_util::{sink::SinkExt, stream::StreamExt};
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{error, info, warn};
 
@@ -70,9 +70,19 @@ const CHUNK_SIZE: usize = 4096;
 /// Maximum number of stored messages per mailbox.
 const MAILBOX_MAX: usize = 50;
 
-// TODO: Add periodic mailbox cleanup (e.g., Tokio interval) to drop messages
-// older than N hours if the recipient never connects. Without TTL, the mailbox
-// grows unboundedly.
+/// Messages older than this TTL are dropped during periodic cleanup.
+const MAILBOX_TTL: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
+
+/// How often the mailbox cleanup task runs.
+const MAILBOX_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60); // 1 hour
+
+/// A single mailbox message with a timestamp for TTL-based expiration.
+struct StoredMessage {
+    /// When this message was queued (server monotonic clock).
+    queued_at: tokio::time::Instant,
+    /// The pre-built forward frame bytes (zero-knowledge — server never sees plaintext).
+    data: Vec<u8>,
+}
 
 /// Shared application state.
 ///
@@ -80,12 +90,13 @@ const MAILBOX_MAX: usize = 50;
 ///   Client IDs are raw bytes (public key hashes). Multiple connections
 ///   may share the same client ID (e.g. multiple browser tabs).
 /// - `mailboxes`: maps client ID → queued messages for offline recipients.
+///   Each message is timestamped for TTL-based garbage collection.
 ///   Messages are stored as pre-built forward frames (zero-knowledge —
 ///   the server never sees plaintext). Delivered and cleared on connect.
 #[derive(Default)]
 struct ConnectionMap {
     clients: HashMap<Vec<u8>, Vec<mpsc::UnboundedSender<Vec<u8>>>>,
-    mailboxes: HashMap<Vec<u8>, Vec<Vec<u8>>>,
+    mailboxes: HashMap<Vec<u8>, Vec<StoredMessage>>,
 }
 
 type SharedState = Arc<RwLock<ConnectionMap>>;
@@ -110,9 +121,17 @@ async fn main() {
 
     let state: SharedState = Arc::default();
 
+    let cleanup_state = state.clone();
+
     let app = Router::new()
         .route("/ws", get(ws_handler))
         .with_state(state);
+
+    // Spawn periodic mailbox cleanup to prevent unbounded memory growth
+    // when a recipient never reconnects.
+    tokio::spawn(async move {
+        mailbox_cleanup_task(cleanup_state).await;
+    });
 
     let port: u16 = std::env::var("PORT")
         .ok()
@@ -365,7 +384,10 @@ async fn relay_message(state: &SharedState, sender_id: &[u8], data: &[u8]) {
             send_error(state, sender_id, recipient_id).await;
             return;
         }
-        mailbox.push(forward);
+        mailbox.push(StoredMessage {
+            queued_at: tokio::time::Instant::now(),
+            data: forward,
+        });
     }
 }
 
@@ -373,12 +395,12 @@ async fn relay_message(state: &SharedState, sender_id: &[u8], data: &[u8]) {
 ///
 /// Format: `[0xFE, 0xFE][u16 LE: count][for each: u16 LE len][msg bytes]`
 /// Padded to CHUNK_SIZE to mask how many messages were stored (traffic analysis).
-fn build_mailbox_delivery(messages: &[Vec<u8>]) -> Vec<u8> {
+fn build_mailbox_delivery(messages: &[StoredMessage]) -> Vec<u8> {
     let mut blob = vec![0xFE, 0xFE];
     blob.extend_from_slice(&(messages.len() as u16).to_le_bytes());
     for msg in messages {
-        blob.extend_from_slice(&(msg.len() as u16).to_le_bytes());
-        blob.extend_from_slice(msg);
+        blob.extend_from_slice(&(msg.data.len() as u16).to_le_bytes());
+        blob.extend_from_slice(&msg.data);
     }
     // Pad to nearest CHUNK_SIZE multiple so an observer cannot infer
     // the number or size of stored messages from traffic volume.
@@ -397,6 +419,57 @@ async fn send_error(state: &SharedState, sender_id: &[u8], recipient_id: &[u8]) 
         error_frame.extend_from_slice(recipient_id);
         for tx in senders.iter() {
             let _ = tx.send(error_frame.clone());
+        }
+    }
+}
+
+/// Periodic background task that scavenges expired mailbox messages.
+///
+/// Runs every `MAILBOX_CLEANUP_INTERVAL` and drops any message whose
+/// `queued_at` timestamp is older than `MAILBOX_TTL`. This prevents
+/// unbounded memory growth when a recipient never reconnects.
+async fn mailbox_cleanup_task(state: SharedState) {
+    let mut interval = tokio::time::interval(MAILBOX_CLEANUP_INTERVAL);
+    // First tick completes immediately — skip it so we don't clean on startup.
+    interval.tick().await;
+
+    loop {
+        interval.tick().await;
+
+        let now = tokio::time::Instant::now();
+        let mut total_dropped = 0usize;
+        let mut expired_recipients = Vec::new();
+
+        {
+            let mut map = state.write().await;
+            for (recipient_id, messages) in map.mailboxes.iter_mut() {
+                let before = messages.len();
+                messages.retain(|m| now.saturating_duration_since(m.queued_at) < MAILBOX_TTL);
+                let dropped = before - messages.len();
+                if dropped > 0 {
+                    total_dropped += dropped;
+                    info!(
+                        "Mailbox cleanup: dropped {} expired messages for {}",
+                        dropped,
+                        hex_fmt(recipient_id, 8)
+                    );
+                }
+                if messages.is_empty() {
+                    expired_recipients.push(recipient_id.clone());
+                }
+            }
+            // Remove empty mailbox entries
+            for id in &expired_recipients {
+                map.mailboxes.remove(id);
+            }
+        }
+
+        if total_dropped > 0 {
+            info!(
+                "Mailbox cleanup complete: dropped {} expired messages across {} recipients cleared",
+                total_dropped,
+                expired_recipients.len()
+            );
         }
     }
 }
