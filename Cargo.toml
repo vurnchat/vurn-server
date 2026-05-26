@@ -2,6 +2,7 @@
 members = [
     "core",
     "server",
+    "web-client",
 ]
 
 resolver = "2"
