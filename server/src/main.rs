@@ -67,6 +67,9 @@ use tracing::{error, info, warn};
 /// Chunk size for mailbox delivery padding (traffic-analysis resistance).
 const CHUNK_SIZE: usize = 4096;
 
+/// Maximum number of stored messages per mailbox.
+const MAILBOX_MAX: usize = 50;
+
 // TODO: Add periodic mailbox cleanup (e.g., Tokio interval) to drop messages
 // older than N hours if the recipient never connects. Without TTL, the mailbox
 // grows unboundedly.
@@ -314,51 +317,55 @@ async fn relay_message(state: &SharedState, sender_id: &[u8], data: &[u8]) {
 
     // Look up the recipient in the connection map.
     // IMPORTANT: the read lock must be released before any further async
-    // operations (write locks, send_error which acquires its own read lock).
-    let (delivered, recipient_online) = {
+    // operations (the write lock for mailbox storage).
+    let delivered = {
         let map = state.read().await;
         if let Some(senders) = map.clients.get(recipient_id) {
             // Forward to all connections of this recipient (e.g. all tabs)
-            let mut delivered = false;
+            let mut ok = false;
             for tx in senders.iter() {
                 if tx.send(forward.clone()).is_ok() {
-                    delivered = true;
+                    ok = true;
                 }
             }
-            (delivered, true)
+            ok
         } else {
-            (false, false)
+            false
         }
     }; // Read lock released here
 
-    if recipient_online {
-        if delivered {
-            info!(
-                "Relayed {}b: {} → {}",
-                payload.len(),
-                hex_fmt(sender_id, 8),
-                hex_fmt(recipient_id, 8)
-            );
-        } else {
-            warn!(
-                "All connections lost for recipient: {}",
-                hex_fmt(recipient_id, 8)
-            );
-            send_error(state, sender_id, recipient_id).await;
-        }
-    } else {
-        // Recipient not connected — store in their cryptographic mailbox.
-        // The server never sees plaintext; this is just a blind forward frame.
+    if delivered {
         info!(
-            "Recipient offline, queued {}b in mailbox: {}",
+            "Relayed {}b: {} → {}",
+            payload.len(),
+            hex_fmt(sender_id, 8),
+            hex_fmt(recipient_id, 8)
+        );
+    } else {
+        // Recipient is offline or all their connections dropped (race on cleanup).
+        // Store in their cryptographic mailbox — the server never sees plaintext,
+        // this is just a blind forward frame. Messages are never silently lost.
+        info!(
+            "Recipient unavailable, queued {}b in mailbox: {}",
             payload.len(),
             hex_fmt(recipient_id, 8)
         );
         let mut map = state.write().await;
-        map.mailboxes
+        let mailbox = map.mailboxes
             .entry(recipient_id.to_vec())
-            .or_default()
-            .push(forward);
+            .or_default();
+        if mailbox.len() >= MAILBOX_MAX {
+            warn!(
+                "Mailbox full for {} ({} msgs), dropping oldest, notifying sender",
+                hex_fmt(recipient_id, 8),
+                MAILBOX_MAX
+            );
+            mailbox.remove(0);
+            // Notify the sender that their message could not be stored
+            send_error(state, sender_id, recipient_id).await;
+            return;
+        }
+        mailbox.push(forward);
     }
 }
 
