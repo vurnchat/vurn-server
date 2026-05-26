@@ -312,16 +312,26 @@ async fn relay_message(state: &SharedState, sender_id: &[u8], data: &[u8]) {
     forward.extend_from_slice(sender_id);
     forward.extend_from_slice(payload);
 
-    // Look up the recipient in the connection map
-    let map = state.read().await;
-    if let Some(senders) = map.clients.get(recipient_id) {
-        // Forward to all connections of this recipient (e.g. all tabs)
-        let mut delivered = false;
-        for tx in senders.iter() {
-            if tx.send(forward.clone()).is_ok() {
-                delivered = true;
+    // Look up the recipient in the connection map.
+    // IMPORTANT: the read lock must be released before any further async
+    // operations (write locks, send_error which acquires its own read lock).
+    let (delivered, recipient_online) = {
+        let map = state.read().await;
+        if let Some(senders) = map.clients.get(recipient_id) {
+            // Forward to all connections of this recipient (e.g. all tabs)
+            let mut delivered = false;
+            for tx in senders.iter() {
+                if tx.send(forward.clone()).is_ok() {
+                    delivered = true;
+                }
             }
+            (delivered, true)
+        } else {
+            (false, false)
         }
+    }; // Read lock released here
+
+    if recipient_online {
         if delivered {
             info!(
                 "Relayed {}b: {} → {}",
