@@ -138,11 +138,15 @@ struct ProfileEntry {
 ///   Each entry stores the owner's session ID (for authorization) and the
 ///   encrypted profile blob. The server can look up profiles by index but
 ///   cannot decrypt the blob or recover the original username from the index.
+/// - `user_profiles`: maps owner session ID → current search index.
+///   Enforces one username per user — when a user registers a new username,
+///   the old one is automatically removed.
 #[derive(Default)]
 struct ConnectionMap {
     clients: HashMap<Vec<u8>, Vec<mpsc::UnboundedSender<Vec<u8>>>>,
     mailboxes: HashMap<Vec<u8>, Vec<StoredMessage>>,
     blind_profiles: HashMap<Vec<u8>, ProfileEntry>,
+    user_profiles: HashMap<Vec<u8>, Vec<u8>>,
 }
 
 type SharedState = Arc<RwLock<ConnectionMap>>;
@@ -575,9 +579,14 @@ async fn handle_profile_operation(
 ///
 /// Payload: `[32 bytes: search_index][encrypted profile blob]`
 ///
-/// If the index is already registered, returns `[0xFF, 0x00, 0x01]` (occupied).
-/// On success, stores the blob with the caller's session ID as owner
-/// and returns `[0xFE, 0x00, 0x00]`.
+/// **One username per user**: If the caller already owns a username (tracked in
+/// `user_profiles`), the old profile is automatically removed before registering
+/// the new one. This means "Set Username" and "Change Username" are the same
+/// server operation — the client just sends RegisterProfile with the new index.
+///
+/// If the new index is already taken by a **different** user, returns
+/// `[0xFF, 0x00, 0x01]` (occupied) **without** removing the caller's old profile.
+/// On success, returns `[0xFE, 0x00, 0x00]`.
 /// The server never sees the plaintext username or public key.
 async fn handle_register_profile(
     state: &SharedState,
@@ -589,31 +598,56 @@ async fn handle_register_profile(
         return None;
     }
 
-    let index = payload[..32].to_vec();
+    let new_index = payload[..32].to_vec();
     let blob = payload[32..].to_vec();
 
     let response = {
         let mut map = state.write().await;
-        if map.blind_profiles.contains_key(&index) {
+
+        // Check if the new index is taken by a DIFFERENT user
+        if let Some(existing) = map.blind_profiles.get(&new_index) {
+            if existing.owner_hash != owner_id {
+                info!(
+                    "RegisterProfile: username already taken by other user (index={})",
+                    hex_fmt(&new_index, 8)
+                );
+                return Some(vec![0xFF, 0x00, 0x01]); // occupied by someone else
+            }
+            // Same user re-registering same username — just update the blob
             info!(
-                "RegisterProfile: username already taken (index={})",
-                hex_fmt(&index, 8)
+                "RegisterProfile: re-registering same username (index={})",
+                hex_fmt(&new_index, 8)
             );
-            vec![0xFF, 0x00, 0x01] // error: username occupied
-        } else {
-            map.blind_profiles.insert(
-                index.clone(),
-                ProfileEntry {
-                    owner_hash: owner_id.to_vec(),
-                    blob,
-                },
-            );
-            info!(
-                "RegisterProfile: registered new profile (index={})",
-                hex_fmt(&index, 8)
-            );
-            vec![0xFE, 0x00, 0x00] // success
         }
+
+        // Remove user's OLD profile if they had a different username
+        let old_index = map.user_profiles.get(owner_id).cloned();
+        if let Some(ref old) = old_index {
+            if *old != new_index {
+                map.blind_profiles.remove(old);
+                info!(
+                    "RegisterProfile: removed old profile (old_index={}, new_index={})",
+                    hex_fmt(old, 8),
+                    hex_fmt(&new_index, 8)
+                );
+            }
+        }
+
+        // Insert/update the new profile
+        map.blind_profiles.insert(
+            new_index.clone(),
+            ProfileEntry {
+                owner_hash: owner_id.to_vec(),
+                blob,
+            },
+        );
+        map.user_profiles.insert(owner_id.to_vec(), new_index.clone());
+
+        info!(
+            "RegisterProfile: registered profile (index={})",
+            hex_fmt(&new_index, 8)
+        );
+        vec![0xFE, 0x00, 0x00] // success
     }; // write lock released
 
     Some(response)
