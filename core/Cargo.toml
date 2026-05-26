@@ -10,5 +10,7 @@ ml-kem = { version = "0.2", features = ["std", "zeroize"] }
 aes-gcm = "0.10"
 rand = { version = "0.8", features = ["getrandom"] }
 sha2 = "0.10"
+pbkdf2 = { version = "0.12", features = ["simple"] }
+hmac = "0.12"
 
 [dev-dependencies]

@@ -27,6 +27,7 @@ use ml_kem::{
     kem::{Decapsulate, DecapsulationKey, Encapsulate, EncapsulationKey},
     EncodedSizeUser, KemCore, MlKem1024, MlKem1024Params,
 };
+use pbkdf2::pbkdf2_hmac_array;
 use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
 
@@ -154,6 +155,55 @@ impl VurnCipher {
         let mut hasher = Sha256::new();
         hasher.update(public_key);
         hasher.finalize().to_vec()
+    }
+
+    /// Derives a 256-bit AES key from a password and salt using PBKDF2-HMAC-SHA256.
+    ///
+    /// Uses 600,000 iterations — tuned for ~1 second of work on modern hardware.
+    pub fn derive_key(password: &str, salt: &[u8]) -> [u8; 32] {
+        pbkdf2_hmac_array::<Sha256, 32>(password.as_bytes(), salt, 600_000)
+    }
+
+    /// Encrypts data with AES-256-GCM using a raw 32-byte key.
+    ///
+    /// Wire format: `[12 bytes: random nonce][encrypted payload + 16-byte GCM tag]`.
+    /// Used for local storage encryption (profile, contacts).
+    pub fn encrypt_symmetric(key: &[u8; 32], plaintext: &[u8]) -> Vec<u8> {
+        let aes_key = aes_gcm::Key::<Aes256Gcm>::from_slice(key);
+        let cipher = Aes256Gcm::new(aes_key);
+
+        let mut rng = OsRng;
+        let mut nonce_bytes = [0u8; 12];
+        rng.fill_bytes(&mut nonce_bytes);
+        let nonce = Nonce::from_slice(&nonce_bytes);
+
+        let encrypted = cipher
+            .encrypt(nonce, plaintext)
+            .expect("AES-GCM encrypt should not fail");
+
+        let mut result = Vec::with_capacity(12 + encrypted.len());
+        result.extend_from_slice(&nonce_bytes);
+        result.extend_from_slice(&encrypted);
+        result
+    }
+
+    /// Decrypts data that was encrypted with `encrypt_symmetric`.
+    ///
+    /// Returns an error if the key is wrong or the data has been tampered with.
+    pub fn decrypt_symmetric(key: &[u8; 32], ciphertext: &[u8]) -> Result<Vec<u8>, String> {
+        if ciphertext.len() < 12 + 16 {
+            return Err("Ciphertext too short".to_string());
+        }
+
+        let aes_key = aes_gcm::Key::<Aes256Gcm>::from_slice(key);
+        let cipher = Aes256Gcm::new(aes_key);
+
+        let nonce = Nonce::from_slice(&ciphertext[..12]);
+        let payload = &ciphertext[12..];
+
+        cipher
+            .decrypt(nonce, payload)
+            .map_err(|e| format!("Decryption failed: {}", e))
     }
 }
 
