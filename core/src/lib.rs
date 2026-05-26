@@ -159,7 +159,15 @@ impl VurnCipher {
 
     /// Derives a 256-bit AES key from a password and salt using PBKDF2-HMAC-SHA256.
     ///
-    /// Uses 600,000 iterations — tuned for ~1 second of work on modern hardware.
+    /// Iteration count adapts to target:
+    /// - WASM (browser): 100,000 (~100-300ms) — browser tab is ephemeral, keys erased on close
+    /// - Native (server/CLI): 600,000 (~1s) — hardware protection against offline brute-force
+    #[cfg(target_arch = "wasm32")]
+    pub fn derive_key(password: &str, salt: &[u8]) -> [u8; 32] {
+        pbkdf2_hmac_array::<Sha256, 32>(password.as_bytes(), salt, 100_000)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn derive_key(password: &str, salt: &[u8]) -> [u8; 32] {
         pbkdf2_hmac_array::<Sha256, 32>(password.as_bytes(), salt, 600_000)
     }
