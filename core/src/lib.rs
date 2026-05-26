@@ -427,4 +427,302 @@ mod tests {
             assert!(g.chars().all(|c| c.is_ascii_digit()), "Groups must be digits only");
         }
     }
+
+    /// Simulates the full mailbox delivery pipeline:
+    /// 1. Alice encrypts a message for Bob
+    /// 2. Alice builds a wire frame: [recipient_id_len][recipient_id=bob_hash][encrypted_payload]
+    /// 3. Server relays → builds forward frame: [sender_id_len][sender_id=alice_hash][encrypted_payload]
+    /// 4. Bob is offline → server stores in mailbox memory
+    /// 5. Bob reconnects → server builds mailbox blob: [0xFE,0xFE][count][len][forward]... padded
+    /// 6. Bob's client receives blob → parses → extracts forward frames → decrypts
+    ///
+    /// This test validates that the ENCRYPTION survives the entire mailbox format round-trip
+    /// without the server ever seeing plaintext.
+    #[test]
+    fn test_mailbox_roundtrip() {
+        // Simulate Alice and Bob
+        let (pk_alice, sk_alice) = VurnCipher::generate_keypair();
+        let (pk_bob, sk_bob) = VurnCipher::generate_keypair();
+
+        let alice_hash = VurnCipher::hash_public_key(&pk_alice);
+        let bob_hash = VurnCipher::hash_public_key(&pk_bob);
+
+        let original_message = b"Hey Bob! This is a secret message from Alice.";
+
+        // ── Step 1: Alice encrypts for Bob ──
+        let encrypted = VurnCipher::encrypt(&pk_bob, original_message)
+            .expect("Alice should encrypt for Bob");
+
+        // ── Step 2: Build the relay frame ──
+        // Client sends: [2 bytes: bob_hash_len][bob_hash bytes][encrypted payload]
+        let mut relay_frame = Vec::new();
+        relay_frame.extend_from_slice(&(bob_hash.len() as u16).to_le_bytes());
+        relay_frame.extend_from_slice(&bob_hash);
+        relay_frame.extend_from_slice(&encrypted);
+
+        // ── Step 3: Server builds forward frame ──
+        // Server parses relay_frame, extracts encrypted payload, builds forward:
+        // [2 bytes: alice_hash_len][alice_hash bytes][encrypted payload]
+        let id_len = u16::from_le_bytes([relay_frame[0], relay_frame[1]]) as usize;
+        let payload = &relay_frame[2 + id_len..];
+
+        let mut forward = Vec::new();
+        forward.extend_from_slice(&(alice_hash.len() as u16).to_le_bytes());
+        forward.extend_from_slice(&alice_hash);
+        forward.extend_from_slice(payload);
+
+        // Verify forward frame is non-empty and contains the encrypted payload
+        assert!(forward.len() > alice_hash.len() + 2, "Forward frame must contain payload");
+
+        // ── Step 4: Store in mailbox (simulate offline) ──
+        let mailbox: Vec<Vec<u8>> = vec![forward];
+        assert_eq!(mailbox.len(), 1, "Mailbox should contain 1 message");
+
+        // ── Step 5: Build mailbox delivery blob (server -> client on reconnect) ──
+        let mut blob = vec![0xFE, 0xFE];
+        blob.extend_from_slice(&(mailbox.len() as u16).to_le_bytes());
+        for msg in &mailbox {
+            blob.extend_from_slice(&(msg.len() as u16).to_le_bytes());
+            blob.extend_from_slice(msg);
+        }
+
+        // ── Step 6: Client parses mailbox blob (simulate on_msg handler) ──
+        assert!(blob.len() >= 4, "Blob must have sentinel + count");
+        assert_eq!(blob[0], 0xFE, "Must start with mailbox sentinel");
+        assert_eq!(blob[1], 0xFE, "Must start with mailbox sentinel");
+
+        let num_msgs = u16::from_le_bytes([blob[2], blob[3]]) as usize;
+        assert_eq!(num_msgs, 1, "Should have 1 message in mailbox");
+
+        let mut pos = 4usize;
+        let mut received_messages = Vec::new();
+
+        for _ in 0..num_msgs {
+            assert!(pos + 2 <= blob.len(), "Position must be within blob");
+            let msg_len = u16::from_le_bytes([blob[pos], blob[pos + 1]]) as usize;
+            pos += 2;
+            assert!(pos + msg_len <= blob.len(), "Message must fit in blob");
+            let msg = &blob[pos..pos + msg_len];
+            pos += msg_len;
+
+            // Parse forward frame: [2 bytes: sender_id_len][sender_id bytes][encrypted payload]
+            assert!(msg.len() >= 2, "Forward frame must have sender_id_len");
+            let sender_id_len = u16::from_le_bytes([msg[0], msg[1]]) as usize;
+            assert!(msg.len() >= 2 + sender_id_len, "Forward frame must have sender_id + payload");
+
+            let sender_hex = hex::encode(&msg[2..2 + sender_id_len]);
+            let encrypted_payload = &msg[2 + sender_id_len..];
+
+            received_messages.push((sender_hex, encrypted_payload.to_vec()));
+        }
+
+        // ── Step 7: Bob decrypts each received message ──
+        assert_eq!(received_messages.len(), 1, "Should have received 1 message");
+        let (sender, encrypted_payload) = &received_messages[0];
+
+        // Verify sender is Alice
+        let expected_sender = hex::encode(&alice_hash);
+        assert_eq!(sender, &expected_sender, "Sender should be Alice's hash");
+
+        // Bob decrypts
+        let decrypted = VurnCipher::decrypt(&sk_bob, encrypted_payload)
+            .expect("Bob should decrypt mailbox message");
+
+        assert_eq!(decrypted, original_message, "Decrypted message must match original");
+    }
+
+    /// Tests that multiple messages in a mailbox maintain correct order
+    /// and all decrypt correctly.
+    #[test]
+    fn test_mailbox_multiple_ordering() {
+        let (pk_alice, sk_alice) = VurnCipher::generate_keypair();
+        let (pk_bob, sk_bob) = VurnCipher::generate_keypair();
+
+        let alice_hash = VurnCipher::hash_public_key(&pk_alice);
+        let bob_hash = VurnCipher::hash_public_key(&pk_bob);
+
+        let messages: [&[u8]; 5] = [
+            b"Message 1: Hello!",
+            b"Message 2: How are you?",
+            b"Message 3: Are you there?",
+            b"Message 4: I have news!",
+            b"Message 5: Call me when you can.",
+        ];
+
+        // Build mailbox with 5 messages from Alice to Bob
+        let mut mailbox: Vec<Vec<u8>> = Vec::new();
+
+        for msg in &messages {
+            let encrypted = VurnCipher::encrypt(&pk_bob, msg)
+                .expect("Encryption should succeed");
+
+            // Build forward frame: [sender_id_len][sender_id][encrypted_payload]
+            let mut forward = Vec::new();
+            forward.extend_from_slice(&(alice_hash.len() as u16).to_le_bytes());
+            forward.extend_from_slice(&alice_hash);
+            forward.extend_from_slice(&encrypted);
+            mailbox.push(forward);
+        }
+
+        assert_eq!(mailbox.len(), 5, "Mailbox should have 5 messages");
+
+        // Build mailbox delivery blob
+        let mut blob = vec![0xFE, 0xFE];
+        blob.extend_from_slice(&(mailbox.len() as u16).to_le_bytes());
+        for msg in &mailbox {
+            blob.extend_from_slice(&(msg.len() as u16).to_le_bytes());
+            blob.extend_from_slice(msg);
+        }
+        // Add padding to verify the client skips padding correctly
+        let padding = 128;
+        blob.resize(blob.len() + padding, 0);
+
+        // Client parses
+        assert!(blob[0] == 0xFE && blob[1] == 0xFE);
+        let num_msgs = u16::from_le_bytes([blob[2], blob[3]]) as usize;
+        assert_eq!(num_msgs, 5, "Should have 5 messages");
+
+        let mut pos = 4usize;
+        let mut decrypted_messages = Vec::new();
+
+        for i in 0..num_msgs {
+            let msg_len = u16::from_le_bytes([blob[pos], blob[pos + 1]]) as usize;
+            pos += 2;
+            let msg = &blob[pos..pos + msg_len];
+            pos += msg_len;
+
+            let sender_id_len = u16::from_le_bytes([msg[0], msg[1]]) as usize;
+            let encrypted_payload = &msg[2 + sender_id_len..];
+
+            let decrypted = VurnCipher::decrypt(&sk_bob, encrypted_payload)
+                .expect(&format!("Message {} should decrypt", i));
+            decrypted_messages.push(decrypted);
+        }
+
+        // Verify order and content
+        for (i, decrypted) in decrypted_messages.iter().enumerate() {
+            assert_eq!(
+                decrypted.as_slice(),
+                messages[i],
+                "Message {} should match original after mailbox round-trip",
+                i
+            );
+        }
+
+        assert_eq!(decrypted_messages.len(), 5, "All 5 messages should be recovered");
+    }
+
+    /// Tests that messages encrypted by different senders
+    /// in the same mailbox are correctly attributed.
+    #[test]
+    fn test_mailbox_multi_sender() {
+        let (pk_alice, _) = VurnCipher::generate_keypair();
+        let (pk_bob, sk_bob) = VurnCipher::generate_keypair();
+        let (pk_charlie, _) = VurnCipher::generate_keypair();
+
+        let alice_hash = VurnCipher::hash_public_key(&pk_alice);
+        let charlie_hash = VurnCipher::hash_public_key(&pk_charlie);
+
+        // Alice sends a message to Bob
+        let msg_alice = b"Hi Bob from Alice!";
+        let encrypted_alice = VurnCipher::encrypt(&pk_bob, msg_alice).unwrap();
+        let mut forward_alice = Vec::new();
+        forward_alice.extend_from_slice(&(alice_hash.len() as u16).to_le_bytes());
+        forward_alice.extend_from_slice(&alice_hash);
+        forward_alice.extend_from_slice(&encrypted_alice);
+
+        // Charlie sends a message to Bob
+        let msg_charlie = b"Hey Bob, it's Charlie!";
+        let encrypted_charlie = VurnCipher::encrypt(&pk_bob, msg_charlie).unwrap();
+        let mut forward_charlie = Vec::new();
+        forward_charlie.extend_from_slice(&(charlie_hash.len() as u16).to_le_bytes());
+        forward_charlie.extend_from_slice(&charlie_hash);
+        forward_charlie.extend_from_slice(&encrypted_charlie);
+
+        // Build mailbox blob
+        let mailbox = vec![forward_alice, forward_charlie];
+        let mut blob = vec![0xFE, 0xFE];
+        blob.extend_from_slice(&(mailbox.len() as u16).to_le_bytes());
+        for msg in &mailbox {
+            blob.extend_from_slice(&(msg.len() as u16).to_le_bytes());
+            blob.extend_from_slice(msg);
+        }
+
+        // Bob parses the mailbox
+        let num_msgs = u16::from_le_bytes([blob[2], blob[3]]) as usize;
+        assert_eq!(num_msgs, 2);
+
+        let mut pos = 4usize;
+        let mut results = Vec::new();
+
+        for _ in 0..num_msgs {
+            let msg_len = u16::from_le_bytes([blob[pos], blob[pos + 1]]) as usize;
+            pos += 2;
+            let msg = &blob[pos..pos + msg_len];
+            pos += msg_len;
+
+            let sender_len = u16::from_le_bytes([msg[0], msg[1]]) as usize;
+            let sender = hex::encode(&msg[2..2 + sender_len]);
+            let payload = &msg[2 + sender_len..];
+
+            let decrypted = VurnCipher::decrypt(&sk_bob, payload).unwrap();
+            let plaintext = String::from_utf8(decrypted).unwrap();
+            results.push((sender, plaintext));
+        }
+
+        // Verify sender attribution
+        assert_eq!(results[0].1, "Hi Bob from Alice!");
+        assert_eq!(results[1].1, "Hey Bob, it's Charlie!");
+
+        // Alice's message should be attributed to Alice
+        assert_eq!(results[0].0, hex::encode(&alice_hash));
+        assert_eq!(results[1].0, hex::encode(&charlie_hash));
+    }
+
+    /// Tests that tampered mailbox messages fail decryption.
+    #[test]
+    fn test_mailbox_tampered_fails() {
+        let (pk_alice, _) = VurnCipher::generate_keypair();
+        let (pk_bob, sk_bob) = VurnCipher::generate_keypair();
+
+        let alice_hash = VurnCipher::hash_public_key(&pk_alice);
+
+        let msg = b"Secret message";
+        let encrypted = VurnCipher::encrypt(&pk_bob, msg).unwrap();
+
+        let mut forward = Vec::new();
+        forward.extend_from_slice(&(alice_hash.len() as u16).to_le_bytes());
+        forward.extend_from_slice(&alice_hash);
+        forward.extend_from_slice(&encrypted);
+
+        // Tamper with the encrypted payload inside the forward frame
+        let payload_start = 2 + alice_hash.len();
+        let tampered_pos = payload_start + 10;
+        if forward.len() > tampered_pos {
+            forward[tampered_pos] ^= 0xFF;
+        }
+
+        // Build mailbox blob
+        let mailbox = vec![forward];
+        let mut blob = vec![0xFE, 0xFE];
+        blob.extend_from_slice(&(mailbox.len() as u16).to_le_bytes());
+        for msg in &mailbox {
+            blob.extend_from_slice(&(msg.len() as u16).to_le_bytes());
+            blob.extend_from_slice(msg);
+        }
+
+        // Parse and try to decrypt
+        let num_msgs = u16::from_le_bytes([blob[2], blob[3]]) as usize;
+        let mut pos = 4usize;
+
+        let _msg_len = u16::from_le_bytes([blob[pos], blob[pos + 1]]) as usize;
+        pos += 2;
+        let msg = &blob[pos..pos + _msg_len];
+
+        let sender_len = u16::from_le_bytes([msg[0], msg[1]]) as usize;
+        let payload = &msg[2 + sender_len..];
+
+        let result = VurnCipher::decrypt(&sk_bob, payload);
+        assert!(result.is_err(), "Tampered mailbox message should fail decryption");
+    }
 }
