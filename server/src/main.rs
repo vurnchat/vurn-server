@@ -60,6 +60,7 @@ use axum::{
     Router,
 };
 use futures_util::{sink::SinkExt, stream::StreamExt};
+use rand::seq::SliceRandom;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{error, info, warn};
@@ -75,6 +76,11 @@ const MAILBOX_TTL: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
 
 /// How often the mailbox cleanup task runs.
 const MAILBOX_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60); // 1 hour
+
+/// Minimum number of messages in every mailbox delivery (traffic-analysis cover).
+/// If fewer real messages exist, random fake forward frames are injected.
+/// The client silently drops them during decryption (wrong key → auth fail).
+const MAILBOX_MIN_COVER: usize = 3;
 
 /// A single mailbox message with a timestamp for TTL-based expiration.
 struct StoredMessage {
@@ -212,17 +218,17 @@ async fn handle_connection(socket: WebSocket, state: SharedState) {
             .or_default()
             .push(tx);
 
-        // Check for stored offline messages and deliver them immediately.
+        // Deliver any stored mailbox messages — always send a padded blob even
+        // when the mailbox is empty, so an observer cannot distinguish "had
+        // messages" from "had no messages" by traffic volume alone.
         if let Some(messages) = map.mailboxes.remove(session_id.as_ref()) {
-            if !messages.is_empty() {
-                let blob = build_mailbox_delivery(&messages);
-                let _ = tx_delivery.send(blob);
-                info!(
-                    "Mailbox: delivered {} stored messages to {}",
-                    messages.len(),
-                    hex_fmt(&session_id, 8)
-                );
-            }
+            let blob = build_mailbox_delivery(&messages);
+            let _ = tx_delivery.send(blob);
+            info!(
+                "Mailbox: delivered {} stored messages to {}",
+                messages.len(),
+                hex_fmt(&session_id, 8)
+            );
         }
     }
 
@@ -391,22 +397,74 @@ async fn relay_message(state: &SharedState, sender_id: &[u8], data: &[u8]) {
     }
 }
 
-/// Builds the mailbox delivery blob for one or more stored messages.
+/// Builds a mailbox delivery blob with traffic-analysis cover messages.
 ///
 /// Format: `[0xFE, 0xFE][u16 LE: count][for each: u16 LE len][msg bytes]`
-/// Padded to CHUNK_SIZE to mask how many messages were stored (traffic analysis).
+/// Padded to CHUNK_SIZE boundary.
+///
+/// If there are fewer than `MAILBOX_MIN_COVER` real messages, random fake
+/// forward frames are injected to make the count always ≥ that threshold.
+/// Real and fake messages are shuffled so an observer cannot tell which are
+/// real by their position in the blob. The client will attempt to decrypt
+/// all messages; fakes fail authentication and are silently dropped.
 fn build_mailbox_delivery(messages: &[StoredMessage]) -> Vec<u8> {
-    let mut blob = vec![0xFE, 0xFE];
-    blob.extend_from_slice(&(messages.len() as u16).to_le_bytes());
-    for msg in messages {
-        blob.extend_from_slice(&(msg.data.len() as u16).to_le_bytes());
-        blob.extend_from_slice(&msg.data);
+    let mut rng = rand::thread_rng();
+
+    // Collect real forward frame data
+    let mut all_frames: Vec<Vec<u8>> = messages.iter().map(|m| m.data.clone()).collect();
+
+    // Inject fake cover messages to reach MAILBOX_MIN_COVER
+    while all_frames.len() < MAILBOX_MIN_COVER {
+        all_frames.push(generate_fake_forward(&mut rng));
     }
-    // Pad to nearest CHUNK_SIZE multiple so an observer cannot infer
-    // the number or size of stored messages from traffic volume.
+
+    // Shuffle so observer cannot distinguish real vs fake by position
+    all_frames.shuffle(&mut rng);
+
+    let total = all_frames.len();
+
+    // Build blob: [0xFE, 0xFE][count][for each: len][data]
+    let mut blob = vec![0xFE, 0xFE];
+    blob.extend_from_slice(&(total as u16).to_le_bytes());
+    for frame in &all_frames {
+        blob.extend_from_slice(&(frame.len() as u16).to_le_bytes());
+        blob.extend_from_slice(frame);
+    }
+
+    // Pad to nearest CHUNK_SIZE multiple so traffic volume alone does not
+    // reveal how many (or how large) the stored messages were.
     let padded_len = ((blob.len() + CHUNK_SIZE - 1) / CHUNK_SIZE) * CHUNK_SIZE;
     blob.resize(padded_len, 0);
     blob
+}
+
+/// Generates a fake forward frame that looks indistinguishable from a real one.
+///
+/// Format: `[2 bytes: sender_id_len = 32][32 random bytes: sender_id][random bytes: encrypted payload]`
+///
+/// The fake encrypted payload has a plausible size range (1500–3000 bytes)
+/// typical of real ML-KEM-1024 + AES-GCM encrypted messages. The client will
+/// try to decrypt it, fail authentication, and silently drop it.
+fn generate_fake_forward(rng: &mut impl rand::Rng) -> Vec<u8> {
+    // Sender ID is always 32 bytes (SHA-256 hash length)
+    let sender_id_len: u16 = 32;
+    let mut frame = Vec::with_capacity(2 + 32 + 2500);
+
+    // Write sender_id length
+    frame.extend_from_slice(&sender_id_len.to_le_bytes());
+
+    // Generate random 32-byte sender hash
+    let mut sender_id = [0u8; 32];
+    rng.fill_bytes(&mut sender_id);
+    frame.extend_from_slice(&sender_id);
+
+    // Generate random encrypted payload (1500–3000 bytes, plausible real range)
+    let payload_len: usize = rng.gen_range(1500..=3000);
+    let mut payload = vec![0u8; payload_len];
+    rng.fill_bytes(&mut payload);
+    frame.extend_from_slice(&payload);
+
+    frame
 }
 
 /// Sends a delivery-failure notification back to the sender.
