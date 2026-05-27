@@ -99,10 +99,24 @@ header "└───────────────────────
 echo ""
 
 # OS check
-if [[ "$(uname -s)" != "Linux" ]]; then
-    err "This installer is designed for Linux only."
-    err "Detected: $(uname -s)"
-    exit 1
+OS="$(uname -s)"
+ARCH="$(uname -m)"
+IS_LINUX=false
+IS_MAC=false
+
+case "$OS" in
+    Linux)   IS_LINUX=true ;;
+    Darwin)  IS_MAC=true ;;
+    *)
+        err "Unsupported OS: $OS (expected Linux or macOS)"
+        exit 1
+        ;;
+esac
+
+if [[ "$IS_MAC" == "true" ]]; then
+    warn "macOS detected — systemd, logrotate, and certbot steps will be skipped."
+    warn "The binary will be installed directly into /usr/local/bin."
+    echo ""
 fi
 
 # Sudo check
@@ -116,7 +130,7 @@ if [[ $EUID -ne 0 ]] && ! command -v sudo &>/dev/null; then
     exit 1
 fi
 
-ok "OS: Linux ($(uname -m))"
+ok "OS: $OS ($ARCH)"
 ok "Privileges: $([ $EUID -eq 0 ] && echo 'root' || echo 'sudo available')"
 
 # ── Step 2: Interactive prompts (if enabled) ────────────────────────
@@ -162,23 +176,28 @@ echo ""
 # ── Step 3: Create vurn user and state directories ──────────────────
 info "Creating system user and directories..."
 
-# Create 'vurn' system user if not exists
-if ! id -u vurn &>/dev/null; then
-    $SUDO useradd \
-        --system \
-        --no-create-home \
-        --shell /usr/sbin/nologin \
-        --comment "VurnChat P2P Node" \
-        vurn
-    ok "Created system user: vurn"
+if [[ "$IS_LINUX" == "true" ]]; then
+    # Create 'vurn' system user if not exists
+    if ! id -u vurn &>/dev/null; then
+        $SUDO useradd \
+            --system \
+            --no-create-home \
+            --shell /usr/sbin/nologin \
+            --comment "VurnChat P2P Node" \
+            vurn
+        ok "Created system user: vurn"
+    else
+        ok "System user vurn already exists"
+    fi
+    $SUDO chown -R vurn:vurn "${STATE_DIR}"
 else
-    ok "System user vurn already exists"
+    # macOS — create directories without dedicated system user
+    ok "Skipping system user creation (macOS)"
 fi
 
 # Create state directory
 $SUDO mkdir -p "${STATE_DIR}"
 $SUDO mkdir -p "${CONFIG_DIR}"
-$SUDO chown -R vurn:vurn "${STATE_DIR}"
 $SUDO chmod 750 "${STATE_DIR}"
 $SUDO chmod 750 "${CONFIG_DIR}"
 ok "State directories created: ${STATE_DIR}, ${CONFIG_DIR}"
@@ -186,17 +205,30 @@ ok "State directories created: ${STATE_DIR}, ${CONFIG_DIR}"
 # ── Step 4: Download binary ─────────────────────────────────────────
 info "Detecting system architecture..."
 
-arch=$(uname -m)
-case "$arch" in
-    x86_64)  binary_arch="x86_64-unknown-linux-gnu" ;;
-    aarch64|arm64) binary_arch="aarch64-unknown-linux-gnu" ;;
-    *)
-        err "Unsupported architecture: $arch (expected x86_64 or aarch64)"
-        exit 1
+case "$OS" in
+    Linux)
+        case "$ARCH" in
+            x86_64)  binary_arch="x86_64-unknown-linux-gnu" ;;
+            aarch64|arm64) binary_arch="aarch64-unknown-linux-gnu" ;;
+            *)
+                err "Unsupported architecture: $ARCH (expected x86_64 or aarch64 on Linux)"
+                exit 1
+                ;;
+        esac
+        ;;
+    Darwin)
+        case "$ARCH" in
+            x86_64)  binary_arch="x86_64-apple-darwin" ;;
+            arm64)   binary_arch="aarch64-apple-darwin" ;;
+            *)
+                err "Unsupported architecture: $ARCH (expected x86_64 or arm64 on macOS)"
+                exit 1
+                ;;
+        esac
         ;;
 esac
 
-ok "Architecture: $arch → ${binary_arch}"
+ok "Architecture: $ARCH → ${binary_arch}"
 echo ""
 
 info "Downloading ${BINARY_NAME} binary..."
@@ -226,18 +258,66 @@ download_with_retry() {
 }
 
 download_with_retry "$BINARY_URL" "$INSTALL_PATH" || {
-    err "Download failed after 3 attempts!"
-    err "URL: ${BINARY_URL}"
-    err "Possible causes:"
-    err "  - Binary not yet published for this release"
-    err "  - Network connectivity issue"
-    err "  - Architecture mismatch"
-    err ""
-    err "You can build from source instead:"
-    err "  git clone https://github.com/${REPO}.git"
-    err "  cd VurnChat && cargo build --release -p vurn-server"
-    err "  sudo cp target/release/vurn-server ${INSTALL_PATH}"
-    exit 1
+    warn "Pre-compiled binary not available for ${binary_arch}."
+    warn "URL tried: ${BINARY_URL}"
+    echo ""
+
+    if [[ "$INTERACTIVE" == "true" ]]; then
+        echo -e -n "  ${YELLOW}?${NC} Build from source instead? [Y/n]: "
+        read -r _build_choice
+        _build_choice="${_build_choice:-y}"
+    else
+        _build_choice="y"
+    fi
+
+    if [[ "$_build_choice" =~ ^[Yy] ]]; then
+        info "Building from source (requires Rust toolchain)..."
+
+        if ! command -v cargo &>/dev/null; then
+            info "Rust not found — installing via rustup..."
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y 2>/dev/null || {
+                err "Rustup installation failed."
+                err "Install manually: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+                exit 1
+            }
+            # Source cargo env for this session
+            if [[ -f "$HOME/.cargo/env" ]]; then
+                source "$HOME/.cargo/env"
+            fi
+        fi
+
+        if ! command -v cargo &>/dev/null; then
+            err "Cargo not found after rustup installation."
+            err "Try: source \"\$HOME/.cargo/env\" && $0"
+            exit 1
+        fi
+
+        ok "Rust toolchain: $(cargo --version)"
+
+        _build_dir=$(mktemp -d)
+        info "Cloning ${REPO}..."
+        git clone --depth 1 "https://github.com/${REPO}.git" "$_build_dir" || {
+            err "Git clone failed. Check internet connection."
+            rm -rf "$_build_dir"
+            exit 1
+        }
+
+        info "Building vurn-server --release (this takes a few minutes)..."
+        (cd "$_build_dir" && cargo build --release -p vurn-server) || {
+            err "Build failed!"
+            rm -rf "$_build_dir"
+            exit 1
+        }
+
+        $SUDO cp "$_build_dir/target/release/vurn-server" "$INSTALL_PATH"
+        $SUDO chmod +x "$INSTALL_PATH"
+        rm -rf "$_build_dir"
+
+        ok "Built from source: ${INSTALL_PATH}"
+    else
+        err "Installation aborted by user."
+        exit 1
+    fi
 }
 
 $SUDO chmod +x "$INSTALL_PATH"
@@ -274,6 +354,14 @@ if [[ ${#BOOTSTRAP_ADDRS[@]} -gt 0 ]]; then
 fi
 
 CERT_ARGS=""
+if [[ "$SSL" == "y" && -n "$DOMAIN" ]]; then
+    if [[ "$IS_MAC" == "true" ]]; then
+        warn "Let's Encrypt / Certbot is not supported on macOS in this installer."
+        warn "Run the server manually with --cert and --key flags after obtaining certificates."
+        SSL="n"
+    fi
+fi
+
 if [[ "$SSL" == "y" && -n "$DOMAIN" ]]; then
     echo ""
     info "Setting up TLS with Let's Encrypt (Certbot)..."
@@ -377,16 +465,19 @@ $SUDO chmod 600 "${CONFIG_DIR}/vurn.env"
 $SUDO chown vurn:vurn "${CONFIG_DIR}/vurn.env"
 ok "Config written: ${CONFIG_DIR}/vurn.env"
 
-# ── Step 7: Create systemd service ──────────────────────────────────
-info "Creating systemd service..."
+# ── Step 7: Create systemd service (Linux only) ──────────────────────────
+if [[ "$IS_MAC" == "true" ]]; then
+    info "Skipping systemd service creation (macOS)"
+else
+    info "Creating systemd service..."
 
-# Build the ExecStart command with all bootstrap addrs
-BOOTSTRAP_CMDLINE=""
-for addr in "${BOOTSTRAP_ADDRS[@]}"; do
-    BOOTSTRAP_CMDLINE="${BOOTSTRAP_CMDLINE} --bootstrap ${addr}"
-done
+    # Build the ExecStart command with all bootstrap addrs
+    BOOTSTRAP_CMDLINE=""
+    for addr in "${BOOTSTRAP_ADDRS[@]}"; do
+        BOOTSTRAP_CMDLINE="${BOOTSTRAP_CMDLINE} --bootstrap ${addr}"
+    done
 
-$SUDO tee "$SERVICE_FILE" > /dev/null <<SERVICEEOF
+    $SUDO tee "$SERVICE_FILE" > /dev/null <<SERVICEEOF
 # VurnChat P2P Node — systemd service
 # Generated by install.sh on $(date -I)
 # See: deploy/vurn.service in the repository for documentation
@@ -439,11 +530,12 @@ SystemCallFilter=@system-service
 WantedBy=multi-user.target
 SERVICEEOF
 
-$SUDO chmod 644 "$SERVICE_FILE"
-ok "Service file created: ${SERVICE_FILE}"
+    $SUDO chmod 644 "$SERVICE_FILE"
+    ok "Service file created: ${SERVICE_FILE}"
+fi
 
-# ── Step 8: Install cert renewal hook ──────────────────────────────
-if [[ "$SSL" == "y" && -n "$DOMAIN" ]]; then
+# ── Step 8: Install cert renewal hook (Linux only) ────────────────────
+if [[ "$SSL" == "y" && -n "$DOMAIN" && "$IS_LINUX" == "true" ]]; then
     RENEWAL_HOOK="/etc/letsencrypt/renewal-hooks/deploy/vurn-restart.sh"
     $SUDO mkdir -p "$(dirname "$RENEWAL_HOOK")"
     $SUDO tee "$RENEWAL_HOOK" > /dev/null <<'HOOKEOF'
@@ -457,10 +549,13 @@ HOOKEOF
     ok "Cert renewal hook installed"
 fi
 
-# ── Step 9: Install logrotate ────────────────────────────────────────
-info "Installing logrotate configuration..."
+# ── Step 9: Install logrotate (Linux only) ─────────────────────────────
+if [[ "$IS_MAC" == "true" ]]; then
+    info "Skipping logrotate configuration (macOS)"
+else
+    info "Installing logrotate configuration..."
 
-$SUDO tee "$LOGROTATE_FILE" > /dev/null <<'LOGROTEOF'
+    $SUDO tee "$LOGROTATE_FILE" > /dev/null <<'LOGROTEOF'
 /var/log/vurn/*.log {
     daily
     missingok
@@ -473,49 +568,68 @@ $SUDO tee "$LOGROTATE_FILE" > /dev/null <<'LOGROTEOF'
 }
 LOGROTEOF
 
-$SUDO chmod 644 "$LOGROTATE_FILE"
-ok "Logrotate installed: ${LOGROTATE_FILE}"
+    $SUDO chmod 644 "$LOGROTATE_FILE"
+    ok "Logrotate installed: ${LOGROTATE_FILE}"
+fi
 
 # ── Step 10: Enable & start service ─────────────────────────────────
 echo ""
-info "Enabling and starting service..."
+if [[ "$IS_MAC" == "true" ]]; then
+    info "Start the server manually:"
+    echo "  ${INSTALL_PATH} --port ${PORT} ${CERT_ARGS:-}"
+    echo ""
+    info "Or run in the background:"
+    echo "  nohup ${INSTALL_PATH} --port ${PORT} ${CERT_ARGS:-} > ${STATE_DIR}/vurn.log 2>&1 &"
+    echo ""
+else
+    info "Enabling and starting service..."
 
-$SUDO systemctl daemon-reload
-$SUDO systemctl enable vurn.service
+    $SUDO systemctl daemon-reload
+    $SUDO systemctl enable vurn.service
 
-# Stop first if running (to pick up new config)
-$SUDO systemctl stop vurn.service 2>/dev/null || true
-sleep 1
-$SUDO systemctl start vurn.service
-
-# ── Step 11: Health check ───────────────────────────────────────────
-echo ""
-info "Waiting for service to start (up to 15 seconds)..."
-
-HEALTH_URL="http://127.0.0.1:${PORT}/health"
-HEALTH_OK=false
-
-for i in $(seq 1 15); do
+    # Stop first if running (to pick up new config)
+    $SUDO systemctl stop vurn.service 2>/dev/null || true
     sleep 1
-    if $SUDO systemctl is-active --quiet vurn.service 2>/dev/null; then
-        # Check the health endpoint
-        if command -v curl &>/dev/null; then
-            if curl -sf "$HEALTH_URL" > /dev/null 2>&1; then
+    $SUDO systemctl start vurn.service
+fi
+
+# ── Step 11: Health check (Linux only — macOS shows manual instructions) ─
+echo ""
+
+if [[ "$IS_MAC" == "true" ]]; then
+    info "To start the server and verify it's working:"
+    echo ""
+    echo -e "  ${BOLD}1.${NC}  ${INSTALL_PATH} --port ${PORT}"
+    echo -e "  ${BOLD}2.${NC}  curl http://127.0.0.1:${PORT}/health"
+    echo ""
+    HEALTH_OK=true  # Don't fail on macOS
+else
+    info "Waiting for service to start (up to 15 seconds)..."
+
+    HEALTH_URL="http://127.0.0.1:${PORT}/health"
+    HEALTH_OK=false
+
+    for i in $(seq 1 15); do
+        sleep 1
+        if $SUDO systemctl is-active --quiet vurn.service 2>/dev/null; then
+            if command -v curl &>/dev/null; then
+                if curl -sf "$HEALTH_URL" > /dev/null 2>&1; then
+                    HEALTH_OK=true
+                    break
+                fi
+            elif command -v wget &>/dev/null; then
+                if wget -q -O /dev/null "$HEALTH_URL" 2>/dev/null; then
+                    HEALTH_OK=true
+                    break
+                fi
+            else
+                # No curl/wget, just check systemd
                 HEALTH_OK=true
                 break
             fi
-        elif command -v wget &>/dev/null; then
-            if wget -q -O /dev/null "$HEALTH_URL" 2>/dev/null; then
-                HEALTH_OK=true
-                break
-            fi
-        else
-            # No curl/wget, just check systemd
-            HEALTH_OK=true
-            break
         fi
-    fi
-done
+    done
+fi
 
 echo ""
 if $HEALTH_OK; then
@@ -529,16 +643,26 @@ if $HEALTH_OK; then
         echo -e "  ${CYAN}Connect:${NC}  ws://YOUR_SERVER_IP:${PORT}/ws"
     fi
     echo ""
-    echo -e "  ${YELLOW}Status:${NC}  sudo systemctl status vurn.service"
-    echo -e "  ${YELLOW}Logs:${NC}    sudo journalctl -u vurn.service -f"
-    echo -e "  ${YELLOW}Health:${NC}  curl http://127.0.0.1:${PORT}/health"
-    echo -e "  ${YELLOW}Config:${NC}  ${CONFIG_DIR}/vurn.env"
+    if [[ "$IS_MAC" == "true" ]]; then
+        echo -e "  ${YELLOW}Run:${NC}     ${INSTALL_PATH} --port ${PORT} ${CERT_ARGS:-}"
+        echo -e "  ${YELLOW}Health:${NC}  curl http://127.0.0.1:${PORT}/health"
+        echo -e "  ${YELLOW}Config:${NC}  ${CONFIG_DIR}/vurn.env"
+    else
+        echo -e "  ${YELLOW}Status:${NC}  sudo systemctl status vurn.service"
+        echo -e "  ${YELLOW}Logs:${NC}    sudo journalctl -u vurn.service -f"
+        echo -e "  ${YELLOW}Health:${NC}  curl http://127.0.0.1:${PORT}/health"
+        echo -e "  ${YELLOW}Config:${NC}  ${CONFIG_DIR}/vurn.env"
+    fi
     echo ""
     ok "Health endpoint responded OK"
 else
     warn "Service may not be fully ready yet."
-    warn "Check status: sudo systemctl status vurn.service"
-    warn "Check logs:   sudo journalctl -u vurn.service -n 50 --no-pager"
+    if [[ "$IS_MAC" == "true" ]]; then
+        warn "Check if the server is running and the port is correct."
+    else
+        warn "Check status: sudo systemctl status vurn.service"
+        warn "Check logs:   sudo journalctl -u vurn.service -n 50 --no-pager"
+    fi
     echo ""
     err "Health check failed after 15 seconds."
     err "This can be normal on first start (P2P discovery takes time)."
@@ -554,9 +678,15 @@ echo ""
 echo -e "  ${BOLD}Binary:${NC}      ${INSTALL_PATH}"
 echo -e "  ${BOLD}Data:${NC}         ${STATE_DIR}/"
 echo -e "  ${BOLD}Config:${NC}       ${CONFIG_DIR}/vurn.env"
-echo -e "  ${BOLD}Service:${NC}      vurn.service"
-echo -e "  ${BOLD}Logs:${NC}         journalctl -u vurn.service -f"
-echo ""
-echo -e "  ${BOLD}TLS renewal:${NC}  Automatic (certbot + built-in 24h reload)"
-echo -e "  ${BOLD}Restart:${NC}      sudo systemctl restart vurn"
+if [[ "$IS_MAC" == "true" ]]; then
+    echo -e "  ${BOLD}Run:${NC}         ${INSTALL_PATH} --port ${PORT}"
+    echo ""
+    echo -e "  ${BOLD}TLS:${NC}         Use --cert and --key flags with your certificates"
+else
+    echo -e "  ${BOLD}Service:${NC}      vurn.service"
+    echo -e "  ${BOLD}Logs:${NC}         journalctl -u vurn.service -f"
+    echo ""
+    echo -e "  ${BOLD}TLS renewal:${NC}  Automatic (certbot + built-in 24h reload)"
+    echo -e "  ${BOLD}Restart:${NC}      sudo systemctl restart vurn"
+fi
 echo ""
