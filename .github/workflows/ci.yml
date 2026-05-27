@@ -1,0 +1,49 @@
+# ── VurnChat CI — Continuous Integration ─────────────────────────────
+#
+# Runs on every push to main and every pull request.
+# Ensures code compiles and all tests pass before merging.
+#
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: cargo test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build (check compiles)
+        run: cargo check -p vurn-core -p vurn-server --all-features
+
+      - name: Run tests
+        run: cargo test -p vurn-core -p vurn-server -- --nocapture
+
+  clippy:
+    name: cargo clippy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Run clippy
+        run: cargo clippy -p vurn-core -p vurn-server -- -D warnings
