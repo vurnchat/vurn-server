@@ -221,6 +221,7 @@ pub fn encode_mailbox_message(sender_hash: &[u8], encrypted_payload: &[u8]) -> V
 }
 
 /// Decodes a mailbox message from DHT storage (legacy format).
+#[allow(dead_code)]
 pub fn decode_mailbox_message(data: &[u8]) -> Result<(&[u8], &[u8]), &'static str> {
     if data.len() < 2 {
         return Err("Mailbox message too short: missing sender_id_len");
@@ -290,8 +291,10 @@ mod tests {
         use ed25519_dalek::SigningKey;
         use rand::rngs::OsRng;
 
-        let mut csprng = OsRng;
-        let signing_key = SigningKey::generate(&mut csprng);
+        let mut seed = [0u8; 32];
+        use rand::RngCore;
+        OsRng.fill_bytes(&mut seed);
+        let signing_key = SigningKey::from_bytes(&seed);
         let verifying_key = signing_key.verifying_key();
 
         let mut envelope = DhtEnvelope {

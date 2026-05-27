@@ -266,15 +266,6 @@ fn check_rate_limit_store(state: &mut GatewayStateInner, client_id: &[u8]) -> bo
     }
 }
 
-/// Check if a client has exceeded their rate limit for lookup operations.
-fn check_rate_limit_lookup(state: &mut GatewayStateInner, client_id: &[u8]) -> bool {
-    if let Some((_, ref mut lookup_bucket)) = state.rate_limiters.get_mut(client_id) {
-        lookup_bucket.try_consume(1.0)
-    } else {
-        true
-    }
-}
-
 /// Try local delivery first, else GossipSub, else store in DHT mailbox.
 async fn relay_or_p2p(state: &SharedState, sender_id: &[u8], data: &[u8]) {
     if data.len() < 2 {

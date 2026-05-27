@@ -164,7 +164,7 @@ async fn main() {
     }
 
     // ── 3. Start Mailbox Manager with shared Sled backup ──
-    let mailbox_mgr = MailboxManager::with_db(sled_db, p2p_node.cmd_tx.clone());
+    let mailbox_mgr = MailboxManager::with_db(sled_db);
 
     // ── 3. Build WS Gateway State ──
     let ws_state: ws::SharedState = Arc::new(RwLock::new(ws::GatewayStateInner {
@@ -303,9 +303,6 @@ async fn handle_p2p_events(
                 set_p2p_connected(ws_state, true).await;
                 // Bootstrap DHT now that we have a listen address
                 let _ = p2p_cmd_tx.send(NodeCommand::Bootstrap).await;
-            }
-            NodeEvent::Error(msg) => {
-                warn!("P2P error: {msg}");
             }
         }
     }

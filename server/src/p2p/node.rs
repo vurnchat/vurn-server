@@ -88,13 +88,10 @@ pub enum NodeEvent {
     MailboxRetrieved { user_hash: Vec<u8>, messages: Vec<Vec<u8>> },
     PeerDiscovered(PeerId),
     ListeningOn(Multiaddr),
-    Error(String),
 }
 
 #[derive(Debug)]
 pub enum NodeCommand {
-    DhtStore { key: Vec<u8>, value: Vec<u8> },
-    DhtGet { key: Vec<u8> },
     /// Store in sequential mailbox — creates signed DhtEnvelope, single put_record.
     MailboxStore { recipient_hash: Vec<u8>, sender_hash: Vec<u8>, payload: Vec<u8> },
     /// Retrieve all messages — uses in-memory index or speculative probing.
@@ -917,24 +914,6 @@ async fn handle_command(
             mailbox_state
         }
 
-        // ── Raw DHT operations ──
-        NodeCommand::DhtStore { key, value } => {
-            use kad::Record;
-            let record = Record {
-                key: kad::RecordKey::new(&key),
-                value,
-                publisher: None,
-                expires: None,
-            };
-            let _ = kademlia.put_record(record, kad::Quorum::Majority);
-            info!("DHT put_record (raw) with Quorum::Majority");
-            mailbox_state
-        }
-        NodeCommand::DhtGet { key } => {
-            kademlia.get_record(kad::RecordKey::new(&key));
-            mailbox_state
-        }
-
         // ── MailboxStore: fast path (in-memory index) or speculative probing ──
         NodeCommand::MailboxStore { recipient_hash, sender_hash, payload } => {
             if !mailbox_state.is_idle() {
@@ -980,7 +959,7 @@ async fn handle_command(
                 publisher: None,
                 expires: None,
             };
-            kademlia.put_record(record, kad::Quorum::Majority);
+            let _ = kademlia.put_record(record, kad::Quorum::Majority);
             info!("ProfileStore: stored profile for index {}", hex_fmt(&index, 8));
             mailbox_state
         }
