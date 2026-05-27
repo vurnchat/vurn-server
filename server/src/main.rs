@@ -129,10 +129,20 @@ async fn main() {
     let args = CliArgs::parse();
     info!("VurnChat P2P node starting...");
 
-    // ── 1. Start P2P node ──
+    // ── 1. Open Sled DB (shared between P2P node and Mailbox manager) ──
+    let db_path = format!("vurn_mailbox_{}.db", args.ws_port);
+    let sled_db = Arc::new(
+        sled::open(&db_path).unwrap_or_else(|e| {
+            warn!("Failed to open Sled DB at {db_path}: {e}, using in-memory fallback");
+            sled::Config::new().temporary(true).open().expect("In-memory sled")
+        })
+    );
+    info!("Sled DB opened at {db_path}");
+
+    // ── 2. Start P2P node ──
     let (p2p_event_tx, mut p2p_event_rx) = mpsc::channel::<NodeEvent>(256);
 
-    let p2p_node = match P2PNode::new(&args.p2p_listen, p2p_event_tx).await {
+    let p2p_node = match P2PNode::new(&args.p2p_listen, p2p_event_tx, sled_db.clone()).await {
         Ok(node) => {
             info!("P2P node started: {}", node.peer_id);
             node
@@ -153,9 +163,8 @@ async fn main() {
         }
     }
 
-    // ── 2. Start Mailbox Manager with Sled backup ──
-    let db_path = format!("vurn_mailbox_{}.db", args.ws_port);
-    let mailbox_mgr = MailboxManager::new(&db_path, p2p_node.cmd_tx.clone());
+    // ── 3. Start Mailbox Manager with shared Sled backup ──
+    let mailbox_mgr = MailboxManager::with_db(sled_db, p2p_node.cmd_tx.clone());
 
     // ── 3. Build WS Gateway State ──
     let ws_state: ws::SharedState = Arc::new(RwLock::new(ws::GatewayStateInner {
@@ -245,15 +254,15 @@ async fn handle_p2p_events(
                     continue;
                 }
 
-                // Persist to Sled via MailboxManager
-                mailbox_mgr.handle_retrieval_result(&user_hash, &messages).await;
+                // Persist to Sled (seq-based dedup) and extract payloads for WS delivery
+                let payloads = mailbox_mgr.handle_retrieval_result(&user_hash, &messages).await;
 
                 // Deliver ONLY to the matching user (privacy fix!)
                 let map = ws_state.read().await;
                 if let Some(senders) = map.clients.get(&user_hash) {
-                    for msg in &messages {
+                    for payload in &payloads {
                         for tx in senders {
-                            let _ = tx.send(msg.clone());
+                            let _ = tx.send(payload.clone());
                         }
                     }
                 } else {

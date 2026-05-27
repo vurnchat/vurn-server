@@ -16,6 +16,7 @@
 
 use std::{
     collections::HashMap,
+    sync::Arc,
     time::{Duration, Instant},
 };
 use ed25519_dalek::SigningKey;
@@ -31,6 +32,7 @@ use tracing::{info, warn, trace};
 use libp2p::{kad, gossipsub, identify};
 
 use crate::p2p::dht;
+use crate::mailbox::SLED_MAILBOX_TREE;
 
 /// Number of seqs to probe in parallel during FetchingIndex (window size).
 const WINDOW_SIZE: u64 = 10;
@@ -161,6 +163,7 @@ impl P2PNode {
     pub async fn new(
         listen_addr: &str,
         event_tx: mpsc::Sender<NodeEvent>,
+        sled_db: Arc<sled::Db>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let keypair = libp2p::identity::Keypair::generate_ed25519();
         let peer_id = keypair.public().to_peer_id();
@@ -245,6 +248,26 @@ impl P2PNode {
                     }
                     cmd = cmd_rx.recv() => {
                         let Some(cmd) = cmd else { break; };
+
+                        // Pre-seed mailbox_indices from Sled for lazy paths,
+                        // so we skip probing when we already have the index.
+                        let user_hash = match &cmd {
+                            NodeCommand::MailboxStore { recipient_hash, .. } =>
+                                Some(recipient_hash.as_slice()),
+                            NodeCommand::MailboxRetrieve { user_hash } =>
+                                Some(user_hash.as_slice()),
+                            _ => None,
+                        };
+                        if let Some(hash) = user_hash {
+                            if mailbox_state.is_idle() && !mailbox_indices.contains_key(hash) {
+                                if let Some(max_seq) = get_sled_max_seq(&sled_db, hash) {
+                                    info!("Sled seed: index={max_seq} for {}",
+                                        hex_fmt(hash, 8));
+                                    mailbox_indices.insert(hash.to_vec(), max_seq);
+                                }
+                            }
+                        }
+
                         mailbox_state = handle_command(
                             &mut swarm, cmd, &ev_tx, mailbox_state,
                             &mut mailbox_indices, &signing_key,
@@ -582,7 +605,7 @@ fn store_signed_envelope(
                 publisher: None,
                 expires: None,
             },
-            kad::Quorum::One,
+            kad::Quorum::Majority,
         );
         mailbox_indices.insert(recipient_hash.to_vec(), seq);
     } else {
@@ -648,13 +671,12 @@ async fn collect_message(
     if let Some(data) = &value {
         if let Ok(envelope) = dht::deserialize_envelope(data) {
             if envelope.seq == seq && dht::verify_envelope(&envelope, &user_hash).is_ok() {
-                // Verified — extract payload (legacy format: sender_hash + encrypted_payload)
-                if let Ok((_sender, _payload)) = dht::decode_mailbox_message(&envelope.payload) {
-                    messages.push(envelope.payload.clone());
-                    info!("MailboxRetrieve: collected verified seq {seq} for {}",
-                        hex_fmt(&user_hash, 8));
-                    verified = true;
-                }
+                // Push full serialized envelope (not just payload) so the consumer
+                // can extract seq for Sled dedup and payload for WS delivery.
+                messages.push(data.clone());
+                info!("MailboxRetrieve: collected verified seq {seq} for {}",
+                    hex_fmt(&user_hash, 8));
+                verified = true;
             }
         }
     }
@@ -753,7 +775,8 @@ async fn handle_command(
                 publisher: None,
                 expires: None,
             };
-            let _ = kademlia.put_record(record, kad::Quorum::One);
+            let _ = kademlia.put_record(record, kad::Quorum::Majority);
+            info!("DHT put_record (raw) with Quorum::Majority");
             mailbox_state
         }
         NodeCommand::DhtGet { key } => {
@@ -956,6 +979,29 @@ fn check_state_timeout(
         }
         _ => state,
     }
+}
+
+/// Scan the Sled mailbox tree for the max seq of a given user_hash.
+/// Key format (new): `[user_hash(32) || seq(8 BE)]`
+/// Legacy timestamp keys are skipped (different length/semantics).
+fn get_sled_max_seq(db: &sled::Db, user_hash: &[u8]) -> Option<u64> {
+    let tree = db.open_tree(SLED_MAILBOX_TREE).ok()?;
+    let prefix = user_hash.to_vec();
+    let mut max_seq = 0u64;
+    for result in tree.scan_prefix(&prefix) {
+        let (key, _) = result.ok()?;
+        // Only consider new-format keys: [user_hash || seq(8 BE)]
+        if key.len() != user_hash.len() + 8 {
+            continue;
+        }
+        let mut arr = [0u8; 8];
+        arr.copy_from_slice(&key[user_hash.len()..]);
+        let seq = u64::from_be_bytes(arr);
+        if seq > max_seq {
+            max_seq = seq;
+        }
+    }
+    if max_seq > 0 { Some(max_seq) } else { None }
 }
 
 // ── Helper ──────────────────────────────────────────────────────────

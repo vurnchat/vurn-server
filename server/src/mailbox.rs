@@ -15,8 +15,9 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{info, warn};
 
-/// Prefix for Sled-tree namespacing
-const SLED_MAILBOX_TREE: &str = "mailbox";
+/// Prefix for Sled-tree namespacing.
+/// Made `pub` so that P2P node (get_sled_max_seq) uses the same constant.
+pub const SLED_MAILBOX_TREE: &str = "mailbox";
 
 /// Shared mailbox manager with Sled backup.
 pub struct MailboxManager {
@@ -38,8 +39,14 @@ impl MailboxManager {
             sled::Config::new().temporary(true).open().expect("In-memory sled")
         });
         info!("MailboxManager: Sled DB opened at {db_path}");
+        Self::with_db(Arc::new(db), p2p_cmd_tx)
+    }
+
+    /// Create a MailboxManager with an already-opened Sled DB.
+    /// Used when the DB is shared with P2PNode (see P1.3 sled seeding).
+    pub fn with_db(db: Arc<sled::Db>, p2p_cmd_tx: mpsc::Sender<NodeCommand>) -> Self {
         Self {
-            db: Arc::new(db),
+            db,
             cmd_tx: p2p_cmd_tx,
             pending_retrievals: Arc::default(),
         }
@@ -103,7 +110,11 @@ impl MailboxManager {
         }
     }
 
-    /// Handle a DHT retrieval result — persist to Sled and return messages.
+    /// Handle a DHT retrieval result — persist to Sled with seq-based dedup and return payloads.
+    ///
+    /// Each message is expected to be a serialized `DhtEnvelope`. We deserialize
+    /// to extract the seq (for Sled dedup key) and the payload (for WS delivery).
+    /// Legacy (non-envelope) messages fall back to timestamp-based keys.
     pub async fn handle_retrieval_result(
         &self,
         user_hash: &[u8],
@@ -115,27 +126,50 @@ impl MailboxManager {
             pending.retain(|k| k != user_hash);
         }
 
-        // Persist to Sled for durability
+        let mut payloads = Vec::with_capacity(messages.len());
+
         for msg in messages {
-            if let Err(e) = self.write_sled_raw(user_hash, msg) {
-                warn!("Sled backup write failed for retrieval: {e}");
+            match dht::deserialize_envelope(msg) {
+                Ok(envelope) => {
+                    // Seq-based key = dedup within user_hash
+                    if let Err(e) = self.write_sled_raw_seq(user_hash, envelope.seq, msg) {
+                        warn!("Sled backup write failed for seq {}: {e}", envelope.seq);
+                    }
+                    payloads.push(envelope.payload.clone());
+                }
+                Err(_) => {
+                    // Legacy non-envelope format — store with timestamp key
+                    if let Err(e) = self.write_sled_raw(user_hash, msg) {
+                        warn!("Sled backup write failed for legacy data: {e}");
+                    }
+                    payloads.push(msg.clone());
+                }
             }
         }
 
         info!(
             "Mailbox: retrieved {} messages from DHT for {}",
-            messages.len(),
+            payloads.len(),
             hex_fmt(user_hash, 8)
         );
 
-        messages.to_vec()
+        payloads
     }
 
-    /// Backup messages that were retrieved via DHT (called from main.rs event handler).
+    /// Backup messages that were retrieved via DHT — seq-based dedup.
     pub async fn backup_retrieved(&self, user_hash: &[u8], messages: &[Vec<u8>]) {
         for msg in messages {
-            if let Err(e) = self.write_sled_raw(user_hash, msg) {
-                warn!("Sled backup_retrieved failed: {e}");
+            match dht::deserialize_envelope(msg) {
+                Ok(envelope) => {
+                    if let Err(e) = self.write_sled_raw_seq(user_hash, envelope.seq, msg) {
+                        warn!("Sled backup_retrieved failed for seq {}: {e}", envelope.seq);
+                    }
+                }
+                Err(_) => {
+                    if let Err(e) = self.write_sled_raw(user_hash, msg) {
+                        warn!("Sled backup_retrieved failed for legacy data: {e}");
+                    }
+                }
             }
         }
     }
@@ -188,6 +222,7 @@ impl MailboxManager {
         Ok(())
     }
 
+    /// Write raw data with a timestamp-based key (legacy fallback, no dedup).
     fn write_sled_raw(&self, user_hash: &[u8], data: &[u8]) -> Result<(), sled::Error> {
         let tree = self.db.open_tree(SLED_MAILBOX_TREE)?;
         let ts = std::time::SystemTime::now()
@@ -195,6 +230,17 @@ impl MailboxManager {
             .unwrap_or_default()
             .as_nanos() as u64;
         let key = [user_hash, &ts.to_le_bytes()].concat();
+        tree.insert(key, data)?;
+        tree.flush()?;
+        Ok(())
+    }
+
+    /// Write envelope data with a seq-based key — dedup-safe.
+    /// Key format: `[user_hash || seq(8-byte BE)]`
+    /// Same seq always maps to the same key, so duplicates overwrite cleanly.
+    fn write_sled_raw_seq(&self, user_hash: &[u8], seq: u64, data: &[u8]) -> Result<(), sled::Error> {
+        let tree = self.db.open_tree(SLED_MAILBOX_TREE)?;
+        let key = [user_hash, &seq.to_be_bytes()].concat();
         tree.insert(key, data)?;
         tree.flush()?;
         Ok(())
