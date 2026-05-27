@@ -25,7 +25,7 @@
 set -euo pipefail
 
 # ── Constants ───────────────────────────────────────────────────────
-REPO="scramble22/VurnChat"
+REPO="vurnchat/vurn-server"
 BINARY_NAME="vurn-server"
 INSTALL_PATH="/usr/local/bin/${BINARY_NAME}"
 STATE_DIR="/var/lib/vurn"
