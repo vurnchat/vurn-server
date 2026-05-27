@@ -70,6 +70,21 @@ pub fn parse_user_hash_from_key(key: &[u8]) -> Option<&[u8]> {
     Some(&after_prefix[..hash_end])
 }
 
+/// Extract both user hash AND sequence number from a mailbox key.
+/// Format: `vmb_<hash>_<seq>` where seq is 0-padded 20-digit decimal.
+/// Returns `(user_hash, seq)` or `None` if the key is not a valid mailbox seq key.
+pub fn parse_mailbox_key(key: &[u8]) -> Option<(Vec<u8>, u64)> {
+    let user_hash = parse_user_hash_from_key(key)?;
+    // Find the underscore after the hash
+    let after_prefix = &key[4..];
+    let hash_end = after_prefix.iter().position(|&b| b == b'_')?;
+    // Everything after this underscore is the decimal seq string
+    let seq_str = &after_prefix[hash_end + 1..];
+    let seq_str_utf8 = std::str::from_utf8(seq_str).ok()?;
+    let seq: u64 = seq_str_utf8.parse().ok()?;
+    Some((user_hash.to_vec(), seq))
+}
+
 // ── DhtEnvelope serialization ──────────────────────────────────────
 
 /// Serialize a DhtEnvelope into binary via bincode.

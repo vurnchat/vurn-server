@@ -32,6 +32,9 @@ use libp2p::{kad, gossipsub, identify};
 
 use crate::p2p::dht;
 
+/// Number of seqs to probe in parallel during FetchingIndex (window size).
+const WINDOW_SIZE: u64 = 10;
+
 // ── Composed behaviour ──────────────────────────────────────────────
 
 #[derive(libp2p::swarm::NetworkBehaviour)]
@@ -110,14 +113,21 @@ impl PendingNodeCommand {
 
 enum MailboxState {
     Idle,
-    /// Speculatively probing DHT seq 1, 2, 3... until finding a gap.
-    /// Falls back to Idle after 30 seconds if no DHT response arrives.
+    /// Speculatively probing DHT in parallel windows of WINDOW_SIZE.
+    /// Fires WINDOW_SIZE `get_record` calls at once, waits for all responses
+    /// before advancing to the next window. Falls back to Idle after 30s.
     FetchingIndex {
         pending_command: PendingNodeCommand,
-        /// Next seq to probe (starts at 1, increments on each FoundRecord)
-        probe_seq: u64,
-        /// Highest consecutively verified seq found
+        /// Start seq of the current probing window
+        window_start: u64,
+        /// Highest consecutively verified seq found (across all windows)
         max_found: u64,
+        /// Map from kad QueryId to seq — enables exact matching of
+        /// FinishedWithNoAdditionalRecord to the right seq (since that
+        /// event doesn't carry the original query key).
+        pending_queries: HashMap<kad::QueryId, u64>,
+        /// Seqs in the current window confirmed present (envelope verified)
+        found: Vec<u64>,
         /// Deadline: if exceeded, transition to Idle to avoid hanging
         deadline: std::time::Instant,
     },
@@ -328,18 +338,18 @@ async fn handle_kad_event(
     signing_key: &SigningKey,
 ) -> MailboxState {
     match event {
-        kad::Event::OutboundQueryProgressed { result, .. } => {
+        kad::Event::OutboundQueryProgressed { id, result, .. } => {
             use kad::QueryResult;
             match result {
                 QueryResult::GetRecord(Ok(ok)) => match ok {
                     kad::GetRecordOk::FoundRecord(peer_record) => {
                         let key = peer_record.record.key.to_vec();
                         let value = peer_record.record.value.clone();
-                        state = handle_found_record(key, Some(value), ev_tx, swarm, state, mailbox_indices, signing_key).await;
+                        state = handle_found_record(key, Some(value), id, ev_tx, swarm, state, mailbox_indices, signing_key).await;
                     }
                     kad::GetRecordOk::FinishedWithNoAdditionalRecord { .. } => {
-                        // A seq key not found — signals end of mailbox OR gap
-                        state = handle_not_found(ev_tx, swarm, state, mailbox_indices, signing_key).await;
+                        // A seq key not found — match by query id
+                        state = handle_not_found(id, ev_tx, swarm, state, mailbox_indices, signing_key).await;
                     }
                 },
                 QueryResult::GetRecord(Err(e)) => {
@@ -376,6 +386,7 @@ async fn handle_kad_event(
 async fn handle_found_record(
     key: Vec<u8>,
     value: Option<Vec<u8>>,
+    query_id: kad::QueryId,
     ev_tx: &mpsc::Sender<NodeEvent>,
     swarm: &mut libp2p::Swarm<NodeBehaviour>,
     state: MailboxState,
@@ -385,39 +396,53 @@ async fn handle_found_record(
     use MailboxState::*;
 
     match state {
-        // ── FetchingIndex: we got a record at probe_seq ──
-        FetchingIndex { pending_command, probe_seq, max_found, deadline } => {
+        // ── FetchingIndex: parallel window probing ──
+        FetchingIndex { pending_command, window_start, max_found, mut pending_queries, mut found, deadline } => {
             let user_hash = pending_command.user_hash().to_vec();
 
-            // Try to verify the envelope
-            let valid = value.as_ref()
+            // Extract seq from the response key
+            let response_seq = dht::parse_mailbox_key(&key)
+                .map(|(_, seq)| seq);
+
+            let response_seq = match response_seq {
+                Some(s) => s,
+                None => {
+                    warn!("FetchingIndex: got response for non-mailbox key, ignoring");
+                    return FetchingIndex {
+                        pending_command, window_start, max_found, pending_queries, found, deadline
+                    };
+                }
+            };
+
+            // Remove from pending_queries (OK if already removed — duplicate response)
+            pending_queries.remove(&query_id);
+
+            // Verify envelope
+            let is_valid = value.as_ref()
                 .and_then(|v| dht::deserialize_envelope(v).ok())
-                .filter(|env| {
-                    // Check seq matches our probe and signature is valid
-                    env.seq == probe_seq && dht::verify_envelope(env, &user_hash).is_ok()
-                })
+                .filter(|env| env.seq == response_seq && dht::verify_envelope(env, &user_hash).is_ok())
                 .is_some();
 
-            if valid {
-                info!("FetchingIndex: verified seq {probe_seq} for {}",
-                    hex_fmt(&user_hash, 8));
-                // Advance to next probe
-                let next_seq = probe_seq + 1;
-                let seq_key = dht::mailbox_seq_key(&user_hash, next_seq);
-                swarm.behaviour_mut().kademlia.get_record(seq_key);
-                FetchingIndex {
-                    pending_command,
-                    probe_seq: next_seq,
-                    max_found: probe_seq,
-                    deadline,
-                }
+            if is_valid {
+                found.push(response_seq);
+                let new_max = max_found.max(response_seq);
+                info!("FetchingIndex: verified seq {response_seq} for {} (window {window_start}–{}, max_found={new_max})",
+                    hex_fmt(&user_hash, 8), window_start + WINDOW_SIZE - 1);
+
+                // Try to resolve the current window
+                try_resolve_window(
+                    pending_command, window_start, new_max, pending_queries, found, deadline,
+                    &user_hash, ev_tx, swarm, mailbox_indices, signing_key,
+                ).await
             } else {
-                // Gap found — this seq doesn't exist or is invalid
-                // Index = max_found (last consecutively verified seq)
-                info!("FetchingIndex: gap at seq {probe_seq} for {}, index={max_found}",
-                    hex_fmt(&user_hash, 8));
-                mailbox_indices.insert(user_hash.clone(), max_found);
-                resume_pending_command(&pending_command, max_found, ev_tx, swarm, mailbox_indices, signing_key).await
+                info!("FetchingIndex: seq {response_seq} invalid/missing for {} (window {window_start}–{})",
+                    hex_fmt(&user_hash, 8), window_start + WINDOW_SIZE - 1);
+
+                // Try to resolve — this seq being missing means it counts as a gap
+                try_resolve_window(
+                    pending_command, window_start, max_found, pending_queries, found, deadline,
+                    &user_hash, ev_tx, swarm, mailbox_indices, signing_key,
+                ).await
             }
         }
 
@@ -442,7 +467,9 @@ async fn handle_found_record(
 }
 
 /// Handle a FinishedWithNoAdditionalRecord (seq not found in DHT).
+/// Uses the `query_id` to look up the exact seq from `pending_queries`.
 async fn handle_not_found(
+    query_id: kad::QueryId,
     ev_tx: &mpsc::Sender<NodeEvent>,
     swarm: &mut libp2p::Swarm<NodeBehaviour>,
     state: MailboxState,
@@ -452,13 +479,28 @@ async fn handle_not_found(
     use MailboxState::*;
 
     match state {
-        FetchingIndex { pending_command, probe_seq, max_found, deadline: _ } => {
+        FetchingIndex { pending_command, window_start, max_found, mut pending_queries, found, deadline } => {
             let user_hash = pending_command.user_hash().to_vec();
-            // DHT says this seq doesn't exist — gap found
-            info!("FetchingIndex: seq {probe_seq} not in DHT for {}, index={max_found}",
-                hex_fmt(&user_hash, 8));
-            mailbox_indices.insert(user_hash.clone(), max_found);
-            resume_pending_command(&pending_command, max_found, ev_tx, swarm, mailbox_indices, signing_key).await
+
+            // Look up the exact seq by QueryId — guaranteed correct match
+            let missing_seq = match pending_queries.remove(&query_id) {
+                Some(seq) => seq,
+                None => {
+                    warn!("FetchingIndex: FinishedWithNoAdditionalRecord for unknown query, ignoring");
+                    return FetchingIndex {
+                        pending_command, window_start, max_found, pending_queries, found, deadline
+                    };
+                }
+            };
+
+            info!("FetchingIndex: seq {missing_seq} not in DHT for {} (window {window_start}–{}, {} remaining pending)",
+                hex_fmt(&user_hash, 8), window_start + WINDOW_SIZE - 1, pending_queries.len());
+
+            // Try to resolve the window — the missing seq counts as a gap
+            try_resolve_window(
+                pending_command, window_start, max_found, pending_queries, found, deadline,
+                &user_hash, ev_tx, swarm, mailbox_indices, signing_key,
+            ).await
         }
         CollectingMessages { user_hash, messages, remaining, deadline } => {
             // Seq doesn't exist — skip it and continue
@@ -732,20 +774,22 @@ async fn handle_command(
                 return mailbox_state;
             }
 
-            // Lazy seeding: index not in memory, probe sequentially from seq 1
-            info!("MailboxStore (lazy): probing seq 1 for {}",
-                hex_fmt(&recipient_hash, 8));
-            let seq_key = dht::mailbox_seq_key(&recipient_hash, 1);
-            kademlia.get_record(seq_key);
+            // Lazy seeding: fire parallel window from seq 1
+            info!("MailboxStore (lazy): firing window 1–{} for {}",
+                WINDOW_SIZE, hex_fmt(&recipient_hash, 8));
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let pending_queries = fire_window(kademlia, &recipient_hash, 1, WINDOW_SIZE);
             MailboxState::FetchingIndex {
                 pending_command: PendingNodeCommand::MailboxStore {
                     recipient_hash,
                     sender_hash,
                     payload,
                 },
-                probe_seq: 1,
+                window_start: 1,
                 max_found: 0,
-                deadline: Instant::now() + Duration::from_secs(30),
+                pending_queries,
+                found: vec![],
+                deadline,
             }
         }
 
@@ -780,16 +824,18 @@ async fn handle_command(
                 };
             }
 
-            // Lazy seeding: probe sequentially from seq 1
-            info!("MailboxRetrieve (lazy): probing seq 1 for {}",
-                hex_fmt(&user_hash, 8));
-            let seq_key = dht::mailbox_seq_key(&user_hash, 1);
-            kademlia.get_record(seq_key);
+            // Lazy seeding: fire parallel window from seq 1
+            info!("MailboxRetrieve (lazy): firing window 1–{} for {}",
+                WINDOW_SIZE, hex_fmt(&user_hash, 8));
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let pending_queries = fire_window(kademlia, &user_hash, 1, WINDOW_SIZE);
             MailboxState::FetchingIndex {
                 pending_command: PendingNodeCommand::MailboxRetrieve { user_hash },
-                probe_seq: 1,
+                window_start: 1,
                 max_found: 0,
-                deadline: Instant::now() + Duration::from_secs(30),
+                pending_queries,
+                found: vec![],
+                deadline,
             }
         }
 
@@ -806,6 +852,87 @@ async fn handle_command(
             let _ = kademlia.bootstrap();
             mailbox_state
         }
+    }
+}
+
+/// Fire parallel `get_record` calls for a window of seqs in the DHT.
+/// Returns a map from `QueryId` to seq for exact event matching.
+/// Used by `FetchingIndex` to probe WINDOW_SIZE keys simultaneously.
+fn fire_window(
+    kademlia: &mut kad::Behaviour<MemoryStore>,
+    user_hash: &[u8],
+    start: u64,
+    count: u64,
+) -> HashMap<kad::QueryId, u64> {
+    let mut queries = HashMap::with_capacity(count as usize);
+    for s in start..(start + count) {
+        let key = dht::mailbox_seq_key(user_hash, s);
+        let qid = kademlia.get_record(key);
+        queries.insert(qid, s);
+    }
+    queries
+}
+
+/// Try to resolve the current probing window.
+///
+/// # Logic
+/// 1. Scan from `window_start` upward:
+///    - If any seq still has a pending query → can't conclude, return `FetchingIndex`.
+///    - If any seq is confirmed missing → gap found, `index = seq - 1`.
+/// 2. All seqs in window are found → advance to the next window.
+///
+/// Returns `Idle` (after `resume_pending_command`) or the next `FetchingIndex`.
+async fn try_resolve_window(
+    pending_command: PendingNodeCommand,
+    window_start: u64,
+    max_found: u64,
+    pending_queries: HashMap<kad::QueryId, u64>,
+    found: Vec<u64>,
+    deadline: std::time::Instant,
+    user_hash: &[u8],
+    ev_tx: &mpsc::Sender<NodeEvent>,
+    swarm: &mut libp2p::Swarm<NodeBehaviour>,
+    mailbox_indices: &mut HashMap<Vec<u8>, u64>,
+    signing_key: &SigningKey,
+) -> MailboxState {
+    // Scan from window_start upward looking for the first gap
+    for s in window_start..(window_start + WINDOW_SIZE) {
+        if pending_queries.values().any(|&v| v == s) {
+            // Still waiting for this seq — can't conclude yet
+            return MailboxState::FetchingIndex {
+                pending_command,
+                window_start,
+                max_found,
+                pending_queries,
+                found,
+                deadline,
+            };
+        }
+        if !found.contains(&s) {
+            // s is confirmed missing — gap found!
+            let index = s - 1; // last consecutively verified seq
+            info!("FetchingIndex: gap at seq {s}, index={index} for {}",
+                hex_fmt(user_hash, 8));
+            mailbox_indices.insert(user_hash.to_vec(), index);
+            return resume_pending_command(&pending_command, index, ev_tx, swarm, mailbox_indices, signing_key).await;
+        }
+    }
+
+    // All seqs in this window are found — advance to next window
+    let next_start = window_start + WINDOW_SIZE;
+    info!("FetchingIndex: window {window_start}–{} all found, advancing to {next_start} for {}",
+        window_start + WINDOW_SIZE - 1, hex_fmt(user_hash, 8));
+
+    let kademlia = &mut swarm.behaviour_mut().kademlia;
+    let new_pending_queries = fire_window(kademlia, user_hash, next_start, WINDOW_SIZE);
+
+    MailboxState::FetchingIndex {
+        pending_command,
+        window_start: next_start,
+        max_found,
+        pending_queries: new_pending_queries,
+        found: vec![],
+        deadline,
     }
 }
 
