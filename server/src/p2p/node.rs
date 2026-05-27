@@ -510,7 +510,7 @@ async fn handle_not_found(
     }
 }
 
-/// Resume a pending command with a known index.
+/// Resume a pending command with a known index, using extracted helpers.
 ///
 /// For `MailboxStore`: create signed DhtEnvelope, store at seq = index + 1.
 /// For `MailboxRetrieve`: emit empty (index=0) or start collecting seq messages.
@@ -522,42 +522,12 @@ async fn resume_pending_command(
     mailbox_indices: &mut HashMap<Vec<u8>, u64>,
     signing_key: &SigningKey,
 ) -> MailboxState {
+    let kademlia = &mut swarm.behaviour_mut().kademlia;
+
     match pending {
         PendingNodeCommand::MailboxStore { recipient_hash, sender_hash, payload } => {
             let new_index = index + 1;
-            let seq_key = dht::mailbox_seq_key(recipient_hash, new_index);
-
-            // Build the legacy payload body (sender_hash + encrypted_payload)
-            let msg_body = dht::encode_mailbox_message(sender_hash, payload);
-
-            // Create and sign DhtEnvelope
-            let mut envelope = dht::DhtEnvelope {
-                payload: msg_body,
-                seq: new_index,
-                sender_pubkey: signing_key.verifying_key().to_bytes().to_vec(),
-                signature: vec![],
-            };
-            dht::sign_envelope(&mut envelope, signing_key, recipient_hash);
-
-            let envelope_bytes = match dht::serialize_envelope(&envelope) {
-                Ok(b) => b,
-                Err(e) => {
-                    warn!("Failed to serialize DhtEnvelope: {e}");
-                    return MailboxState::Idle;
-                }
-            };
-
-            // Single put_record — no index key!
-            let _ = swarm.behaviour_mut().kademlia.put_record(
-                kad::Record {
-                    key: seq_key,
-                    value: envelope_bytes,
-                    publisher: None,
-                    expires: None,
-                },
-                kad::Quorum::One,
-            );
-            mailbox_indices.insert(recipient_hash.clone(), new_index);
+            store_signed_envelope(kademlia, recipient_hash, sender_hash, payload, new_index, signing_key, mailbox_indices);
             info!("MailboxStore (lazy): signed seq {new_index} for {}",
                 hex_fmt(recipient_hash, 8));
             MailboxState::Idle
@@ -566,27 +536,90 @@ async fn resume_pending_command(
             if index == 0 {
                 info!("MailboxRetrieve (lazy): index=0 for {}",
                     hex_fmt(user_hash, 8));
-                let _ = ev_tx.send(NodeEvent::MailboxRetrieved {
-                    user_hash: user_hash.clone(),
-                    messages: vec![],
-                }).await;
-                MailboxState::Idle
+                return emit_empty_mailbox(user_hash.clone(), ev_tx).await;
             } else {
                 info!("MailboxRetrieve (lazy): index={index}, fetching {index} msgs for {}",
                     hex_fmt(user_hash, 8));
-                let remaining: Vec<u64> = (1..=index).collect();
-                let first_seq = remaining[0];
-                let seq_key = dht::mailbox_seq_key(user_hash, first_seq);
-                swarm.behaviour_mut().kademlia.get_record(seq_key);
-                MailboxState::CollectingMessages {
-                    user_hash: user_hash.clone(),
-                    messages: vec![],
-                    remaining,
-                    deadline: Instant::now() + Duration::from_secs(30),
-                }
+                return start_collecting_messages(kademlia, user_hash.clone(), index);
             }
         }
     }
+}
+
+// ── Shared mailbox helpers ──────────────────────────────────────────
+
+/// Create a signed DhtEnvelope for a mailbox message, store it in DHT,
+/// and update the in-memory index.
+///
+/// Shared by both the fast-path (in-memory index exists) and lazy-path
+/// (index discovered via probing) for `MailboxStore`.
+fn store_signed_envelope(
+    kademlia: &mut kad::Behaviour<MemoryStore>,
+    recipient_hash: &[u8],
+    sender_hash: &[u8],
+    payload: &[u8],
+    seq: u64,
+    signing_key: &SigningKey,
+    mailbox_indices: &mut HashMap<Vec<u8>, u64>,
+) {
+    let seq_key = dht::mailbox_seq_key(recipient_hash, seq);
+
+    let msg_body = dht::encode_mailbox_message(sender_hash, payload);
+
+    let mut envelope = dht::DhtEnvelope {
+        payload: msg_body,
+        seq,
+        sender_pubkey: signing_key.verifying_key().to_bytes().to_vec(),
+        signature: vec![],
+    };
+    dht::sign_envelope(&mut envelope, signing_key, recipient_hash);
+
+    if let Ok(envelope_bytes) = dht::serialize_envelope(&envelope) {
+        let _ = kademlia.put_record(
+            kad::Record {
+                key: seq_key,
+                value: envelope_bytes,
+                publisher: None,
+                expires: None,
+            },
+            kad::Quorum::One,
+        );
+        mailbox_indices.insert(recipient_hash.to_vec(), seq);
+    } else {
+        warn!("store_signed_envelope: failed to serialize DhtEnvelope");
+    }
+}
+
+/// Start collecting mailbox messages by fetching the first seq from DHT.
+/// Shared by both the fast-path and lazy-path for `MailboxRetrieve`.
+fn start_collecting_messages(
+    kademlia: &mut kad::Behaviour<MemoryStore>,
+    user_hash: Vec<u8>,
+    index: u64,
+) -> MailboxState {
+    let remaining: Vec<u64> = (1..=index).collect();
+    let first_seq = remaining[0];
+    let seq_key = dht::mailbox_seq_key(&user_hash, first_seq);
+    kademlia.get_record(seq_key);
+    MailboxState::CollectingMessages {
+        user_hash,
+        messages: vec![],
+        remaining,
+        deadline: Instant::now() + Duration::from_secs(30),
+    }
+}
+
+/// Emit an empty mailbox and return Idle.
+/// Shared by both fast-path and lazy-path for index=0 MailboxRetrieve.
+async fn emit_empty_mailbox(
+    user_hash: Vec<u8>,
+    ev_tx: &mpsc::Sender<NodeEvent>,
+) -> MailboxState {
+    let _ = ev_tx.send(NodeEvent::MailboxRetrieved {
+        user_hash,
+        messages: vec![],
+    }).await;
+    MailboxState::Idle
 }
 
 /// Collect a message from DHT, verify its envelope, and continue or emit.
@@ -738,37 +771,7 @@ async fn handle_command(
             // Fast path: index is in memory
             if let Some(&current_index) = mailbox_indices.get(&recipient_hash) {
                 let new_index = current_index + 1;
-                let seq_key = dht::mailbox_seq_key(&recipient_hash, new_index);
-
-                // Create and sign DhtEnvelope
-                let msg_body = dht::encode_mailbox_message(&sender_hash, &payload);
-                let mut envelope = dht::DhtEnvelope {
-                    payload: msg_body,
-                    seq: new_index,
-                    sender_pubkey: signing_key.verifying_key().to_bytes().to_vec(),
-                    signature: vec![],
-                };
-                dht::sign_envelope(&mut envelope, signing_key, &recipient_hash);
-
-                let envelope_bytes = match dht::serialize_envelope(&envelope) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        warn!("Failed to serialize DhtEnvelope: {e}");
-                        return mailbox_state;
-                    }
-                };
-
-                // Single put_record — no index key!
-                let _ = kademlia.put_record(
-                    kad::Record {
-                        key: seq_key,
-                        value: envelope_bytes,
-                        publisher: None,
-                        expires: None,
-                    },
-                    kad::Quorum::One,
-                );
-                mailbox_indices.insert(recipient_hash.clone(), new_index);
+                store_signed_envelope(kademlia, &recipient_hash, &sender_hash, &payload, new_index, signing_key, mailbox_indices);
                 info!("MailboxStore (fast): signed seq {new_index} for {}",
                     hex_fmt(&recipient_hash, 8));
                 return mailbox_state;
@@ -804,24 +807,11 @@ async fn handle_command(
                 if index == 0 {
                     info!("MailboxRetrieve (fast): index=0 for {}",
                         hex_fmt(&user_hash, 8));
-                    let _ = ev_tx.send(NodeEvent::MailboxRetrieved {
-                        user_hash: user_hash.clone(),
-                        messages: vec![],
-                    }).await;
-                    return mailbox_state;
+                    return emit_empty_mailbox(user_hash, ev_tx).await;
                 }
                 info!("MailboxRetrieve (fast): index={index}, fetching {index} msgs for {}",
                     hex_fmt(&user_hash, 8));
-                let remaining: Vec<u64> = (1..=index).collect();
-                let first_seq = remaining[0];
-                let seq_key = dht::mailbox_seq_key(&user_hash, first_seq);
-                kademlia.get_record(seq_key);
-                return MailboxState::CollectingMessages {
-                    user_hash,
-                    messages: vec![],
-                    remaining,
-                    deadline: Instant::now() + Duration::from_secs(30),
-                };
+                return start_collecting_messages(kademlia, user_hash, index);
             }
 
             // Lazy seeding: fire parallel window from seq 1
