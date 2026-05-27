@@ -1,0 +1,121 @@
+# ── VurnChat Release Workflow ─────────────────────────────────────────
+#
+# Triggered by pushing a tag matching "v*" (e.g. v1.0.0, v0.2.0).
+# Builds vurn-server for Linux (x86_64 + aarch64) and creates a
+# GitHub Release with the binaries, ready for install.sh to consume.
+#
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    name: Build vurn-server (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-linker (aarch64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-aarch64-linux-gnu
+
+      - name: Build release binary
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: |
+          cargo build -p vurn-server --release --target ${{ matrix.target }}
+
+      - name: Strip binary
+        run: |
+          if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" ]]; then
+            aarch64-linux-gnu-strip target/${{ matrix.target }}/release/vurn-server
+          else
+            strip target/${{ matrix.target }}/release/vurn-server
+          fi
+
+      - name: Rename binary for release
+        run: |
+          mv target/${{ matrix.target }}/release/vurn-server \
+             vurn-server-${{ matrix.target }}
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vurn-server-${{ matrix.target }}
+          path: vurn-server-${{ matrix.target }}
+          compression-level: 0
+
+  create-release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh
+
+      - name: Generate release notes
+        id: release_notes
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          cat <<NOTES > release_notes.md
+          ## 🎉 VurnChat Blind Relay Server ${VERSION}
+
+          ### 📥 Installation
+
+          \`\`\`bash
+          curl -sSL https://raw.githubusercontent.com/scramble22/VurnChat/${TAG}/install.sh | bash
+          \`\`\`
+
+          Or download the binary for your architecture below and run:
+          \`\`\`bash
+          chmod +x vurn-server-*
+          ./vurn-server-* --help
+          \`\`\`
+
+          ### 🚀 Quick Start
+
+          \`\`\`bash
+          # Plain WS
+          ./vurn-server-x86_64-unknown-linux-gnu --port 9000
+
+          # WSS with TLS
+          ./vurn-server-x86_64-unknown-linux-gnu --port 443 --cert cert.pem --key key.pem
+          \`\`\`
+
+          ### 🔗 Links
+          - [Source Code](https://github.com/scramble22/VurnChat)
+          - [Documentation](https://github.com/scramble22/VurnChat#readme)
+          NOTES
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: release_notes.md
+          files: |
+            vurn-server-x86_64-unknown-linux-gnu
+            vurn-server-aarch64-unknown-linux-gnu
+
