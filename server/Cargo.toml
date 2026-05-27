@@ -26,6 +26,12 @@ libp2p = { version = "0.56", default-features = false, features = [
 # Embedded database for local mailbox backup
 sled = "0.34"
 
+# Ed25519 signing for DhtEnvelope Zero-Trust
+ed25519-dalek = "2"
+
+# Binary serialization for DhtEnvelope
+bincode = "1"
+
 # TLS / WSS support
 tokio-rustls = "0.26"
 rustls = { version = "0.23", features = ["ring"] }

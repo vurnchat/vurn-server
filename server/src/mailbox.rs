@@ -52,8 +52,6 @@ impl MailboxManager {
         sender_hash: &[u8],
         encrypted_payload: &[u8],
     ) {
-        let msg = dht::encode_mailbox_message(sender_hash, encrypted_payload);
-
         // 1. Write to local Sled backup (ignore errors — DHT is primary)
         if let Err(e) = self.write_sled_mailbox(recipient_hash, sender_hash, encrypted_payload) {
             warn!("Sled mailbox backup write failed: {e}");
