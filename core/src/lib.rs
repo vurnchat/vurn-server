@@ -443,7 +443,7 @@ mod tests {
     #[test]
     fn test_mailbox_roundtrip() {
         // Simulate Alice and Bob
-        let (pk_alice, sk_alice) = VurnCipher::generate_keypair();
+        let (pk_alice, _sk_alice) = VurnCipher::generate_keypair();
         let (pk_bob, sk_bob) = VurnCipher::generate_keypair();
 
         let alice_hash = VurnCipher::hash_public_key(&pk_alice);
@@ -537,11 +537,11 @@ mod tests {
     /// and all decrypt correctly.
     #[test]
     fn test_mailbox_multiple_ordering() {
-        let (pk_alice, sk_alice) = VurnCipher::generate_keypair();
+        let (pk_alice, _sk_alice) = VurnCipher::generate_keypair();
         let (pk_bob, sk_bob) = VurnCipher::generate_keypair();
 
         let alice_hash = VurnCipher::hash_public_key(&pk_alice);
-        let bob_hash = VurnCipher::hash_public_key(&pk_bob);
+        let _bob_hash = VurnCipher::hash_public_key(&pk_bob);
 
         let messages: [&[u8]; 5] = [
             b"Message 1: Hello!",
@@ -618,7 +618,7 @@ mod tests {
     /// in the same mailbox are correctly attributed.
     #[test]
     fn test_mailbox_multi_sender() {
-        let (pk_alice, _) = VurnCipher::generate_keypair();
+        let (pk_alice, _sk_alice) = VurnCipher::generate_keypair();
         let (pk_bob, sk_bob) = VurnCipher::generate_keypair();
         let (pk_charlie, _) = VurnCipher::generate_keypair();
 
@@ -714,12 +714,12 @@ mod tests {
         }
 
         // Parse and try to decrypt
-        let num_msgs = u16::from_le_bytes([blob[2], blob[3]]) as usize;
+        let _num_msgs = u16::from_le_bytes([blob[2], blob[3]]) as usize;
         let mut pos = 4usize;
 
-        let _msg_len = u16::from_le_bytes([blob[pos], blob[pos + 1]]) as usize;
+        let msg_len = u16::from_le_bytes([blob[pos], blob[pos + 1]]) as usize;
         pos += 2;
-        let msg = &blob[pos..pos + _msg_len];
+        let msg = &blob[pos..pos + msg_len];
 
         let sender_len = u16::from_le_bytes([msg[0], msg[1]]) as usize;
         let payload = &msg[2 + sender_len..];
