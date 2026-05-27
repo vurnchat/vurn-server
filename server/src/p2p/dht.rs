@@ -61,24 +61,29 @@ pub fn mailbox_seq_key(user_hash: &[u8], seq: u64) -> RecordKey {
 }
 
 /// Extract the user hash from a mailbox key.
+///
 /// Format: `vmb_<hash>_<seq>` — returns the `<hash>` portion.
+/// Uses the LAST underscore (before seq) to handle hashes containing `_`.
 pub fn parse_user_hash_from_key(key: &[u8]) -> Option<&[u8]> {
     if !key.starts_with(b"vmb_") {
         return None;
     }
     let after_prefix = &key[4..];
-    let hash_end = after_prefix.iter().position(|&b| b == b'_')?;
+    // Find the LAST underscore — the one before the seq portion
+    let hash_end = after_prefix.iter().rposition(|&b| b == b'_')?;
     Some(&after_prefix[..hash_end])
 }
 
 /// Extract both user hash AND sequence number from a mailbox key.
+///
 /// Format: `vmb_<hash>_<seq>` where seq is 0-padded 20-digit decimal.
 /// Returns `(user_hash, seq)` or `None` if the key is not a valid mailbox seq key.
+/// Uses the LAST underscore to handle hashes containing `_`.
 pub fn parse_mailbox_key(key: &[u8]) -> Option<(Vec<u8>, u64)> {
     let user_hash = parse_user_hash_from_key(key)?;
-    // Find the underscore after the hash
+    // Find the LAST underscore (the one before the seq)
     let after_prefix = &key[4..];
-    let hash_end = after_prefix.iter().position(|&b| b == b'_')?;
+    let hash_end = after_prefix.iter().rposition(|&b| b == b'_')?;
     // Everything after this underscore is the decimal seq string
     let seq_str = &after_prefix[hash_end + 1..];
     let seq_str_utf8 = std::str::from_utf8(seq_str).ok()?;
@@ -258,6 +263,19 @@ mod tests {
         assert_eq!(parse_user_hash_from_key(seq_key.to_vec().as_ref()), Some(hash.as_ref()));
         assert!(parse_user_hash_from_key(b"no_prefix").is_none());
         assert!(parse_user_hash_from_key(b"vmb_only").is_none());
+    }
+
+    #[test]
+    fn test_parse_mailbox_key_with_underscores_in_hash() {
+        // Real HMAC-SHA256 output is raw bytes (~12% chance of 0x5F = '_')
+        // so the parser MUST work with hashes containing underscores.
+        let hash = b"test_user_hash_1234567890123456789"; // contains '_'
+        let key = mailbox_seq_key(hash, 42);
+        let parsed = parse_mailbox_key(key.as_ref().to_vec().as_ref());
+        assert!(parsed.is_some(), "Mailbox key with underscores in hash should parse");
+        let (parsed_hash, parsed_seq) = parsed.unwrap();
+        assert_eq!(parsed_hash, hash, "Parsed hash should match (including underscores)");
+        assert_eq!(parsed_seq, 42, "Parsed seq should match");
     }
 
     #[test]
