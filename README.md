@@ -4,6 +4,7 @@
   <img src="https://img.shields.io/badge/Post--Quantum-NIST%20FIPS%20203-00d4aa?style=for-the-badge" alt="NIST FIPS 203"/>
   <img src="https://img.shields.io/badge/AES--256--GCM-%2300a86b.svg?style=for-the-badge" alt="AES-256"/>
   <img src="https://img.shields.io/badge/ML--KEM--1024-Kyber-7b2ff7?style=for-the-badge" alt="ML-KEM-1024"/>
+  <img src="https://img.shields.io/badge/libp2p-P2P-2dd4bf?style=for-the-badge" alt="libp2p P2P"/>
 </p>
 
 <p align="center">
@@ -16,24 +17,24 @@
 <h1 align="center">🔐 VurnChat</h1>
 
 <p align="center">
-  <strong>Post-Quantum Encrypted Messenger<br>Quantum-resistant. Blind server. Zero traces.</strong>
+  <strong>Post-Quantum Encrypted P2P Messenger<br>Quantum-resistant. Fully distributed. Blind server.</strong>
 </p>
 
 <p align="center">
-  <sub>Built entirely in Rust — from cryptography to browser UI —<br>compiled to WebAssembly for the client,<br>backed by a zero-knowledge WebSocket relay.</sub>
+  <sub>Built entirely in Rust — from cryptography to browser UI —<br>compiled to WebAssembly for the client,<br>backed by a distributed P2P network with Kademlia DHT.</sub>
 </p>
 
 ---
 
 ## 🧬 What is VurnChat?
 
-VurnChat is a **quantum-resistant instant messenger** that runs entirely in your browser.
-Every message is encrypted with **ML-KEM-1024** (the NIST-standardized post-quantum key
-encapsulation mechanism, formerly CRYSTALS-Kyber) and **AES-256-GCM**.
+VurnChat is a **quantum-resistant instant messenger** with a fully distributed P2P backbone.
+Every message is encrypted with **ML-KEM-1024** (NIST FIPS 203) + **AES-256-GCM**.
 
-The server is **blind** — it never sees plaintext, never learns who is talking to whom,
-and stores no history. Close the tab and everything vanishes from memory — no traces
-left on disk.
+Messages are delivered through a **Kademlia DHT** — there is no central server.
+Each node acts as both a router and a mailbox for offline recipients.
+The server never sees plaintext, never learns who is talking to whom,
+and stores no history beyond what the DHT distributes.
 
 > **Threat model:** Resistant to *harvest-now-decrypt-later* attacks.
 > Even an adversary with a large-scale quantum computer recording all your
@@ -43,35 +44,36 @@ left on disk.
 
 ## 🏗 Architecture
 
+### Overview
+
 ```
-┌──────────────────────┐         ┌──────────────────┐         ┌──────────────────────┐
-│     Browser Tab       │         │                  │         │     Browser Tab       │
-│     ────────────      │         │   vurn-server    │         │     ────────────      │
-│                       │  ws://  │   ────────────   │  ws://  │                       │
-│  ┌─────────────────┐  │ ◄─────► │                   ◄─────► │  ┌─────────────────┐  │
-│  │   vurn-web       │  │         │  Blind relay:     │         │  │   vurn-web       │  │
-│  │   Leptos + WASM  │  │         │  • no decryption  │         │  │   Leptos + WASM  │  │
-│  │                  │  │         │  • no logging     │         │  │                  │  │
-│  │  ┌─────────────┐ │  │         │  • no storage     │         │  │  ┌─────────────┐ │  │
-│  │  │ vurn-core    │ │  │         │  • no metadata   │         │  │  │ vurn-core    │ │  │
-│  │  │ ML-KEM-1024  │ │  │         │                  │         │  │  │ ML-KEM-1024  │ │  │
-│  │  │ AES-256-GCM  │ │  │         │                  │         │  │  │ AES-256-GCM  │ │  │
-│  │  │ SHA-256      │ │  │         │                  │         │  │  │ SHA-256      │ │  │
-│  │  └─────────────┘ │  │         │                  │         │  │  └─────────────┘ │  │
-│  └─────────────────┘  │         │                  │         │  └─────────────────┘  │
-│                       │         │                  │         │                       │
-│  Keys & messages      │         │   Port 9000      │         │  Keys & messages      │
-│  in RAM only          │         │                  │         │  in RAM only          │
-└──────────────────────┘         └──────────────────┘         └──────────────────────┘
+┌──────────────────────┐         ┌──────────────────────┐        ┌──────────────────────┐
+│     Browser Tab A    │         │   P2P Node A          │        │   P2P Node B          │
+│     ────────────     │  ws://  │   ────────────        │  P2P   │   ────────────        │
+│                      │ ◄─────► │                       │ ◄─────►│                       │
+│  ┌─────────────────┐ │         │  ┌─────────────────┐  │ libp2p │  ┌─────────────────┐  │
+│  │   vurn-web       │ │         │  │ Kademlia DHT    │  │ Noise  │  │ Kademlia DHT    │  │
+│  │   Leptos + WASM  │ │         │  │ GossipSub       │  │ TCP    │  │ GossipSub       │  │
+│  │                  │ │         │  │ Identify/Ping   │  │        │  │ Identify/Ping   │  │
+│  │  ┌─────────────┐ │ │         │  │                 │  │        │  │                 │  │
+│  │  │ vurn-core    │ │ │         │  │ MailboxManager  │  │        │  │ MailboxManager  │  │
+│  │  │ ML-KEM-1024  │ │ │         │  │ (Sled backup)   │  │        │  │ (Sled backup)   │  │
+│  │  │ AES-256-GCM  │ │ │         │  └─────────────────┘  │        │  └─────────────────┘  │
+│  │  │ SHA-256      │ │ │         │                       │        │                       │
+│  │  └─────────────┘ │ │         │  WS Gateway (:9000)    │        │  WS Gateway (:9001)    │
+│  └─────────────────┘  │         └──────────────────────┘        └──────────────────────┘
+│                       │
+│  Keys in RAM only     │
+└───────────────────────┘
 ```
 
 ### Three crates, one workspace
 
 | Crate | Role | Tech |
 |-------|------|------|
-| **`vurn-core`** | Cryptographic engine | `ml-kem`, `aes-gcm`, `sha2`, `rand` |
-| **`vurn-server`** | Blind WebSocket relay | `axum`, `tokio`, `tracing` |
-| **`vurn-web`** | Browser client (WASM) | `leptos`, `wasm-bindgen`, `web-sys` |
+| **`vurn-core`** | Cryptographic engine | `ml-kem`, `aes-gcm`, `sha2`, `hmac`, `pbkdf2` |
+| **`vurn-server`** | P2P node + WS gateway | `libp2p`, `axum`, `tokio`, `sled`, `rustls` |
+| **`vurn-web`** | Browser client (WASM) | `leptos`, `wasm-bindgen`, `web-sys`, `rexie` |
 
 ---
 
@@ -88,22 +90,10 @@ OsRng (system entropy: /dev/urandom or crypto.getRandomValues)
         └─► DecapsulationKey  (~3,168 bytes) — SECRET: never leaves your device
 ```
 
-- **ML-KEM-1024** is NIST FIPS 203 (formerly CRYSTALS-Kyber-1024), a lattice-based
-  key encapsulation mechanism believed to be secure against both classical and
-  quantum adversaries.
-- All secret key material uses the `zeroize` crate — memory is wiped on `drop()`.
+- **ML-KEM-1024** is NIST FIPS 203, a lattice-based key encapsulation mechanism
+  believed to be secure against both classical and quantum adversaries.
+- All secret key material is wiped from memory on `drop()` via `zeroize`.
 - `#![forbid(unsafe_code)]` in `vurn-core` — the crypto path contains **zero unsafe Rust**.
-
-### Encryption (`encrypt`)
-
-```
-1. Deserialize recipient's EncapsulationKey
-2. ek.encapsulate(&mut rng) ──► kem_ct + shared_key (32 bytes)
-3. shared_key → Key<Aes256Gcm>
-4. Generate random 12-byte nonce
-5. AES-256-GCM encrypt(plaintext) ──► ciphertext + 16-byte auth tag
-6. Pack into wire format
-```
 
 ### Wire Format
 
@@ -117,196 +107,159 @@ OsRng (system entropy: /dev/urandom or crypto.getRandomValues)
 
 ### Guarantees
 
-- **IND-CCA2 security** via ML-KEM — the shared key is indistinguishable from random
-- **Authenticated encryption** via AES-GCM — any tampering is detected and decryption fails
-- **Fresh keys per message** — a new ML-KEM encapsulation is performed for every message,
-  so the AES key is never reused
-- **Post-quantum forward secrecy** — even if your long-term secret key is later compromised,
-  past messages remain secure (the ephemeral shared key is never stored)
+- **IND-CCA2 security** via ML-KEM
+- **Authenticated encryption** via AES-GCM — tampering is detected
+- **Fresh key per message** — AES key is never reused
+- **Post-quantum** — lattice-based, resistant to quantum cryptanalysis
 
-### Message Encryption / Decryption
+### Local Storage Encryption
 
-```
-Alice's public key ──► VurnCipher::encrypt("Hello") ──► [wire_format_bytes]
-                                                              │
-                                              WebSocket relay (server is blind)
-                                                              │
-                                                              ▼
-Bob's secret key ────► VurnCipher::decrypt(bytes) ─────► "Hello"
-```
+Encrypted profiles, contacts, and messages are stored in IndexedDB
+(web-client) or Sled (server), encrypted with AES-256-GCM using a
+key derived via PBKDF2-HMAC-SHA256 (100k iterations in WASM,
+600k on native).
 
 ---
 
-## 📡 Network Protocol (vurn-server)
+## 🌐 P2P Network Layer
 
-### Connection & Registration
+### Node Discovery
 
-1. Client opens WebSocket → `ws://host:9000/ws`
-2. Client sends **first binary message**: its public key hash (SHA-256, 32 bytes)
-   as its session ID
-3. Server registers the client in an in-memory `HashMap<Vec<u8>, Sender>`
+Nodes discover each other via:
+- **Identify protocol** — automatic peer info exchange on connection
+- **Kademlia RoutingUpdated** events — routing table gossip
+- **Manual `--bootstrap`** — initial peer to join the network
 
-### Sending a Message
+### Mailbox: Sequential DHT Keys
 
-Client frames each outgoing message:
-
-```
-┌──────────────┬───────────────────────┬──────────────────────────┐
-│   2 bytes    │     N bytes           │       M bytes            │
-│  r_id_len    │   recipient_id        │   encrypted payload      │
-│  (u16 LE)    │  (SHA-256 hash of PK) │  (vurn-core wire format) │
-└──────────────┴───────────────────────┴──────────────────────────┘
-```
-
-The server:
-1. Parses `recipient_id` from the frame
-2. Looks up the recipient in the connection map
-3. Forwards to the recipient: `[sender_id_len][sender_id][payload]`
-
-### Error Delivery
-
-If the recipient is offline, the server sends back to the sender:
+Kademlia stores **one value per key**. To support multiple offline messages,
+VurnChat uses sequential key composition:
 
 ```
-[0xFF, 0xFF][original_recipient_id_bytes]
+vmb_<recipient_hash>_index  →  u64 (current message count)
+vmb_<recipient_hash>_00001  →  message #1
+vmb_<recipient_hash>_00002  →  message #2
+...
 ```
 
-The client displays a ⚠ delivery failure notification.
+**Store flow:**
+1. Read an **in-memory** `HashMap<Vec<u8>, u64>` index (synchronous, no DHT round-trip)
+2. Increment → `put_record` at `vmb_<hash>_<seq>`
+3. Update in-memory index
+4. Best-effort `put_record` at `vmb_<hash>_index` (DHT hint for other nodes)
 
-### What the Server Does NOT Know
+**Retrieve flow (DHT state machine):**
+1. `get_record` for `vmb_<hash>_index` → get count
+2. For `seq = 1..=count`: `get_record` for each `vmb_<hash>_<seq>`
+3. Collect all messages → emit `MailboxRetrieved` event
 
-- ❌ Who is messaging whom (only opaque hashes, meaningless without key material)
-- ❌ Message contents (encrypted with the recipient's public key)
-- ❌ Message history (no database, no filesystem persistence)
-- ❌ Key material (never transmitted in plaintext)
+### Local Backup
 
-The server is ~200 lines of Rust. You can audit it in minutes.
+Every message is backed up to a **Sled embedded database** before DHT storage.
+If the DHT is unavailable or `QuorumFailed`, messages are not lost.
+
+### Privacy
+
+Messages are delivered **only** to the matching `user_hash` in the WS gateway —
+not broadcast to all connected clients (critical privacy fix).
+
+### Profiles Are Local (Not Distributed)
+
+Username registrations (`blind_profiles`) live in **each node's local memory**,
+not in the DHT. Registering a username on Node A does not make it visible
+on Node B. Profile distribution across the P2P network is a future enhancement.
+For cross-node discovery, use **invite links** (direct P2P contact addition)
+or ensure both users connect to the same node.
 
 ---
 
-## 🌐 Web Client (vurn-web)
+## 📡 Server: `vurn-server`
 
-### Tech Stack
-
-- **Leptos 0.6** — reactive Rust UI framework with CSR (client-side rendering)
-- **wasm-bindgen** — Rust ↔ JavaScript bridge
-- **Trunk** — WASM bundler and dev server
-- **`getrandom` with `js` feature** — delegates to `crypto.getRandomValues()` in the browser
-  (never uses predictable Math.random)
-
-### UX Flow
-
-```
-┌──────────────┐      ┌──────────────────┐      ┌─────────────────┐
-│   Setup      │      │   Connect        │      │   Chat          │
-│              │      │                  │      │                 │
-│  Generate    │ ───► │  Connect to      │ ───► │  Paste contact  │
-│  keys        │      │  server          │      │  public key     │
-│              │      │                  │      │                 │
-│  Copy public │      │  Send session ID │      │  Send/receive   │
-│  key & ID    │      │                  │      │  encrypted msgs │
-└──────────────┘      └──────────────────┘      └─────────────────┘
-```
-
-### Security Properties
-
-- **In-memory only** — keys and messages live in Leptos signals in RAM. Close tab → everything erased.
-- **No localStorage, no IndexedDB, no cookies** — zero persistent storage.
-- **WASM randomness** — `getrandom` uses `crypto.getRandomValues()` in browsers;
-  on native, uses `/dev/urandom`.
-- **Copy-to-clipboard** for sharing public keys (via `navigator.clipboard.writeText()`)
-
----
-
-## 🚀 Quick Start
-
-### Prerequisites
-
-- **Rust** (stable, 1.75+): [rustup.rs](https://rustup.rs)
-- **Trunk** (WASM bundler): `cargo install trunk`
-- **WASM target**: `rustup target add wasm32-unknown-unknown`
-
-### 1. Clone & Build
+### Quick Start
 
 ```bash
-git clone https://github.com/scramble22/VurnChat.git
-cd VurnChat
-
-# Build everything (native + WASM)
-cargo build --workspace
-cargo build -p vurn-web --target wasm32-unknown-unknown
-cargo test -p vurn-core
-```
-
-### 2. Start the Server
-
-```bash
-# Default: port 9000
+# WS mode (development)
 cargo run -p vurn-server
 
 # Custom port
-cargo run -p vurn-server -- --port 8081
+cargo run -p vurn-server -- --port 8080
 
-# With TLS (WSS)
-cargo run -p vurn-server -- --cert cert.pem --key key.pem
+# WSS mode (TLS, production)
+cargo run -p vurn-server -- --cert cert.pem --key key.pem --port 443
+
+# Join a P2P network
+cargo run -p vurn-server -- --bootstrap /ip4/1.2.3.4/tcp/9001
 ```
 
-You should see:
-```
-VurnChat relay server starting on 0.0.0.0:9000 (WS mode)
-```
-
-### 3. Start the Web Client
-
-```bash
-cd web-client
-trunk serve --port 8080
-```
-
-Wait for the WASM build (~60-120 seconds first time), then:
+### Options
 
 ```
-📡  serving static files at http://127.0.0.1:8080
-```
-
-### 4. Test End-to-End 🎉
-
-1. Open **Tab 1**: `http://localhost:8080`
-2. Click **«Generate Post-Quantum Keypair»**
-3. Click **Copy** on your Public Key — save it to a text file
-4. Click **«Connect to Server & Open Chat»**
-5. Open **Tab 2**: `http://localhost:8080`
-6. Repeat steps 2-4
-7. Paste **Tab 1's** public key into Tab 2's input field → click **Start**
-8. Type a message → click **Send**
-9. Return to **Tab 1**: paste **Tab 2's** public key → click **Start**
-10. You should see the decrypted message!
-
-```bash
-# Stop everything
-kill $(lsof -ti:9000)  # server
-kill $(lsof -ti:8080)  # web client
-```
-
-### Command-line reference
-
-```
-VurnChat Blind Relay Server
+VurnChat P2P Node v2
 
 Usage:
-  vurn-server [--port <PORT>] [--cert <CERT> --key <KEY>]
+  vurn-server [OPTIONS]
 
 Options:
-  --port <PORT>     Port to listen on (default: 9000)
-  --cert <CERT>     Path to TLS certificate PEM file
-  --key <KEY>       Path to TLS private key PEM file
-  --help, -h        Show this help message
+  --port <PORT>         WS/WSS gateway port (default: 9000)
+  --listen-p2p <ADDR>   P2P listen addr (default: /ip4/0.0.0.0/tcp/0)
+  --bootstrap <ADDR>    Bootstrap P2P node (repeatable)
+  --cert <FILE>         TLS certificate (enables WSS)
+  --key <FILE>          TLS private key (enables WSS)
+  --help, -h            Show this help
 
 Examples:
   vurn-server
   vurn-server --port 8080
-  vurn-server --cert cert.pem --key key.pem
-  vurn-server --port 443 --cert /etc/letsencrypt/live/example.com/fullchain.pem --key /etc/letsencrypt/live/example.com/privkey.pem
+  vurn-server --listen-p2p /ip4/0.0.0.0/tcp/9002
+  vurn-server --cert cert.pem --key key.pem --port 443
+  vurn-server --bootstrap /ip4/1.2.3.4/tcp/9001
+```
+
+### What the Server Does NOT Know
+
+| Property | Status |
+|----------|--------|
+| Message contents | ❌ Encrypted end-to-end, server is blind |
+| Sender/recipient identity | ❌ Opaque hashes only, meaningless without key material |
+| Username | ❌ BlindIdentity — HMAC-based, server never sees plaintext |
+| Message history (Sled) | ❌ Local backup, node-specific |
+| Key material | ❌ Never transmitted over the wire |
+
+### What Exists (and Why)
+
+| Data | Where | Purpose |
+|------|-------|---------|
+| DHT records | Kademlia (global) | Offline mailbox — any node can retrieve |
+| Sled backup | Each node (local) | Durability if DHT is unavailable |
+| Blind profiles | Node memory (local) | Username → public key lookup (NOT in DHT) |
+| Client data | IndexedDB (browser) | Encrypted contacts, messages, profile |
+
+---
+
+## 🌐 Web Client (`vurn-web`)
+
+### Tech Stack
+
+- **Leptos 0.6** — reactive Rust UI framework (CSR)
+- **wasm-bindgen** — Rust ↔ JavaScript bridge
+- **Trunk** — WASM bundler
+- **`getrandom` (js feature)** — `crypto.getRandomValues()` in browser
+- **`rexie`** — IndexedDB wrapper for encrypted local persistence
+
+### Features
+
+- **Post-quantum key generation** — ML-KEM-1024 in the browser
+- **Blind username registration** — HMAC-based, server never knows the username
+- **Invite links + QR codes** — P2P contact addition without server round-trip
+- **Safety numbers** — 12×5-digit fingerprint, Signal-style verification
+- **Encrypted profiles** — master password derived via PBKDF2, stored in IndexedDB
+- **Zero traces** — close the tab, everything is erased from RAM
+
+### Build
+
+```bash
+cd web-client
+trunk serve --port 8080
 ```
 
 ---
@@ -314,14 +267,15 @@ Examples:
 ## 🧪 Testing
 
 ```bash
-# Run all vurn-core tests (8 tests, all green)
+# Core cryptography (24 tests)
 cargo test -p vurn-core
 
-# Check workspace compiles
-cargo check --workspace
+# P2P integration (same-node + cross-node DHT)
+cargo test -p vurn-server --test p2p_test -- --test-threads=1 --nocapture
 
-# Build WASM target
-cargo build -p vurn-web --target wasm32-unknown-unknown
+# Check everything compiles
+cargo check --workspace
+cargo check --target wasm32-unknown-unknown -p vurn-web
 ```
 
 ---
@@ -330,24 +284,42 @@ cargo build -p vurn-web --target wasm32-unknown-unknown
 
 ```
 VurnChat/
-├── Cargo.toml                  # Workspace root
-├── README.md                   # ← You are here
+├── Cargo.toml                    # Workspace root
+├── README.md                     # ← You are here
 ├── .gitignore
-├── core/                       # vurn-core: cryptographic engine
-│   ├── Cargo.toml              # ml-kem, aes-gcm, sha2, rand, zeroize
+│
+├── core/                         # vurn-core: cryptographic engine
+│   ├── Cargo.toml                # ml-kem, aes-gcm, sha2, hmac, pbkdf2
 │   └── src/
-│       └── lib.rs              # VurnCipher: generate_keypair, encrypt, decrypt, hash_public_key
-├── server/                     # vurn-server: blind WebSocket relay
-│   ├── Cargo.toml              # axum, tokio, tracing
+│       ├── lib.rs                # VurnCipher: generate_keypair, encrypt, decrypt, fingerprint
+│       └── identity.rs           # BlindProfileManager: blind registration, invite links
+│
+├── server/                       # vurn-server: P2P node + WS gateway
+│   ├── Cargo.toml                # libp2p, axum, tokio, sled, rustls
+│   ├── tests/
+│   │   └── p2p_test.rs           # P2P integration tests (same-node + cross-node)
 │   └── src/
-│       └── main.rs             # ConnectionMap, relay_message, graceful shutdown
-└── web-client/                 # vurn-web: browser client (WASM)
-    ├── Cargo.toml              # leptos, wasm-bindgen, web-sys, getrandom(js)
-    ├── index.html              # Trunk entry point
-    ├── style.css               # Dark theme UI
+│       ├── main.rs               # CLI args, event handler, TLS, graceful shutdown
+│       ├── lib.rs                # Re-exports for integration tests
+│       ├── ws.rs                 # WebSocket gateway: registration, relay, mailbox
+│       ├── mailbox.rs            # MailboxManager: Sled backup, dedup
+│       └── p2p/
+│           ├── mod.rs            # Module re-exports
+│           ├── node.rs           # P2PNode: libp2p Swarm, state machine, commands
+│           └── dht.rs            # Sequential key format, encode/decode helpers
+│
+└── web-client/                   # vurn-web: browser client (WASM)
+    ├── Cargo.toml                # leptos, wasm-bindgen, web-sys, rexie
+    ├── index.html                # Trunk entry point
+    ├── style.css                 # Dark theme UI
     └── src/
-        ├── lib.rs              # #[wasm_bindgen(start)] → mount_to_body(App)
-        └── app.rs              # Leptos component: Setup → Connect → Chat
+        ├── lib.rs                # #[wasm_bindgen(start)] → mount_to_body(App)
+        ├── app.rs                # App component: login → connect → chat
+        ├── login.rs              # Master password creation/unlock
+        ├── sidebar.rs            # Contact list, resize, identity section
+        ├── compose.rs            # Message input with auto-resize
+        ├── modals.rs             # Profile, safety numbers, invite, add contact modals
+        └── storage.rs            # IndexedDB: encrypted profile, contacts, messages
 ```
 
 ---
@@ -359,37 +331,41 @@ VurnChat/
 | **Encryption** | ML-KEM-1024 + AES-256-GCM (hybrid) |
 | **Authentication** | GCM authentication tag (16 bytes) |
 | **Key exchange** | ML-KEM encapsulation per message |
-| **Post-quantum** | Lattice-based (Kyber) — NIST FIPS 203 |
+| **Post-quantum** | Lattice-based (NIST FIPS 203) |
 | **Forward secrecy** | Ephemeral shared key per message |
+| **Transport** | TLS/WSS (optional), libp2p Noise |
+| **Username privacy** | BlindIdentity — HMAC + AES-GCM, server never sees plaintext |
 | **Server knowledge** | Zero — opaque hashes only |
-| **Persistence** | None — in-memory only |
+| **Local persistence** | IndexedDB (browser), Sled (server), both encrypted |
 | **Randomness** | OS entropy (`/dev/urandom` / `crypto.getRandomValues`) |
 | **Memory safety** | Rust + `#![forbid(unsafe_code)]` |
 | **Key zeroization** | `zeroize` crate — memory wiped on drop |
-| **Supply chain** | Minimal dependencies, all auditable |
 
 ---
 
 ## 🔮 Roadmap
 
-### v0.2 — Usability
-- [ ] Persistent contact list (localStorage, encrypted with a passphrase)
-- [ ] Multiple simultaneous chats
-- [ ] Message timestamps
-- [ ] Unread message indicators
-- [ ] Connect to arbitrary server URLs (not just localhost:9000)
+### Phase 1 — Security
+- [ ] **DHT аутентификация** — подписывать MailboxStore ed25519 ключом, верифицировать при retrieve
+- [ ] **Seed in-memory index из DHT** — при старте ноды читать `vmb_<hash>_index` для восстановления счётчика
+- [ ] **Rate limiting** — ограничить частоту DHT и WS операций на клиента
 
-### v0.3 — Security Hardening
-- [ ] Contact verification via fingerprint comparison (Signal-style safety numbers)
-- [ ] Periodic ephemeral key rotation (forward secrecy)
-- [ ] Server authentication (TLS/WSS)
-- [ ] Rate limiting on the relay server
+### Phase 2 — Reliability
+- [ ] **P2P reconnect** — автопереподключение при обрыве P2P соединения
+- [ ] **WS auto-reconnect** — клиент переподключается при `onclose`/`onerror`
+- [ ] **NAT Traversal** — libp2p relay + dcutr + hole-punching
+- [ ] **Graceful shutdown P2P** — дожидаться завершения P2P event loop
 
-### v1.0 — Production
-- [ ] Docker images for server + static web-client
-- [ ] Tor hidden service (.onion) support
-- [ ] Mobile clients (iOS/Android via `uniffi` bindings to vurn-core)
-- [ ] P2P mode (WebRTC via `libp2p`, bypassing the relay server entirely)
+### Phase 3 — Production
+- [ ] **Dockerfile** + docker-compose
+- [ ] **Health endpoint** (`GET /health`)
+- [ ] **Persistent peer store** — восстановление routing table после рестарта
+- [ ] **Mobile clients** — iOS/Android через uniffi bindings к vurn-core
+
+### Phase 4 — Distribution
+- [ ] **Распределённые профили** — хранить `blind_profiles` в DHT, а не локально
+- [ ] **GossipSub для realtime** — использовать GossipSub для online-доставки, DHT только для offline mailbox
+- [ ] **Public bootstrap ноды** — пул публичных нод по умолчанию (как у IPFS)
 
 ---
 

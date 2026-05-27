@@ -105,6 +105,17 @@ async fn handle_ws_connection(socket: WebSocket, gateway_state: SharedState) {
     }
 
     info!("Client registered: {}", hex_fmt(&session_id, 8));
+
+    // Trigger DHT mailbox retrieval for offline messages
+    {
+        let map = gateway_state.read().await;
+        if let Some(ref cmd_tx) = map.p2p_cmd_tx {
+            let cmd = NodeCommand::MailboxRetrieve { user_hash: session_id.clone() };
+            let _ = cmd_tx.send(cmd).await;
+            info!("MailboxRetrieve triggered for {}", hex_fmt(&session_id, 8));
+        }
+    }
+
     let session_id = Arc::new(session_id);
 
     // Step 2: Create forwarding channel
@@ -217,23 +228,22 @@ async fn relay_or_p2p(state: &SharedState, sender_id: &[u8], data: &[u8]) {
         return;
     }
 
-    // Store in DHT mailbox via P2P node
+    // Store in sequential DHT mailbox via P2P node
     info!(
-        "P2P store: queueing {}b for {} in DHT",
+        "MailboxStore: queueing {}b for {}",
         payload.len(),
         hex_fmt(recipient_id, 8)
     );
 
     let map = state.read().await;
     if let Some(ref cmd_tx) = map.p2p_cmd_tx {
-        let msg = crate::p2p::encode_mailbox_message(sender_id, payload);
-        let key = crate::p2p::mailbox_key(recipient_id);
-        let cmd = NodeCommand::DhtStore {
-            key: key.to_vec(),
-            value: msg,
+        let cmd = NodeCommand::MailboxStore {
+            recipient_hash: recipient_id.to_vec(),
+            sender_hash: sender_id.to_vec(),
+            payload: payload.to_vec(),
         };
         if let Err(e) = cmd_tx.send(cmd).await {
-            warn!("Failed to send DHT store: {e}");
+            warn!("Failed to send MailboxStore: {e}");
         }
     }
 }

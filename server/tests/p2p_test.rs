@@ -99,23 +99,20 @@ async fn test_p2p_dht_same_node() {
     .await;
 
     match retrieved {
-        Some(NodeEvent::MailboxRetrieved { key, value }) => {
-            let key_hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
-            match value {
-                Some(data) => {
-                    let text = String::from_utf8_lossy(&data);
-                    info!("✅ Local DHT retrieve SUCCESS! key={key_hex}, value={text}");
-                    assert_eq!(
-                        data.as_slice(),
-                        test_value,
-                        "Retrieved value should match stored value"
-                    );
-                    println!("PASS: Same-node DHT store+retrieve works correctly!");
-                }
-                None => {
-                    panic!("❌ DHT retrieve returned key={key_hex} but value was None (not found)")
-                }
+        Some(NodeEvent::MailboxRetrieved { user_hash, messages }) => {
+            let hash_hex: String = user_hash.iter().map(|b| format!("{b:02x}")).collect();
+            if messages.is_empty() {
+                panic!("❌ DHT retrieve returned 0 messages for user_hash={hash_hex}")
             }
+            let data = &messages[0];
+            let text = String::from_utf8_lossy(data);
+            info!("✅ Local DHT retrieve SUCCESS! user_hash={hash_hex}, value={text}");
+            assert_eq!(
+                data.as_slice(),
+                test_value,
+                "Retrieved value should match stored value"
+            );
+            println!("PASS: Same-node DHT store+retrieve works correctly!");
         }
         Some(other) => {
             panic!("❌ Expected MailboxRetrieved, got: {other:?}")
@@ -228,23 +225,20 @@ async fn test_p2p_dht_cross_node() {
     .await;
 
     match retrieved {
-        Some(NodeEvent::MailboxRetrieved { key, value }) => {
-            let key_hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
-            match value {
-                Some(data) => {
-                    let text = String::from_utf8_lossy(&data);
-                    info!("✅ Cross-node DHT retrieve SUCCESS! key={key_hex}, value={text}");
-                    assert_eq!(
-                        data.as_slice(),
-                        test_value,
-                        "Retrieved value should match stored value"
-                    );
-                    println!("PASS: Cross-node DHT store+retrieve works correctly!");
-                }
-                None => {
-                    panic!("❌ DHT retrieve returned key={key_hex} but value was None (not found)")
-                }
+        Some(NodeEvent::MailboxRetrieved { user_hash, messages }) => {
+            let hash_hex: String = user_hash.iter().map(|b| format!("{b:02x}")).collect();
+            if messages.is_empty() {
+                panic!("❌ Cross-node DHT retrieve returned 0 messages for user_hash={hash_hex}")
             }
+            let data = &messages[0];
+            let text = String::from_utf8_lossy(data);
+            info!("✅ Cross-node DHT retrieve SUCCESS! user_hash={hash_hex}, value={text}");
+            assert_eq!(
+                data.as_slice(),
+                test_value,
+                "Retrieved value should match stored value"
+            );
+            println!("PASS: Cross-node DHT store+retrieve works correctly!");
         }
         Some(other) => {
             panic!("❌ Expected MailboxRetrieved, got: {other:?}")

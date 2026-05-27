@@ -11,4 +11,4 @@ pub mod node;
 pub mod dht;
 
 pub use node::{P2PNode, NodeEvent, NodeCommand};
-pub use dht::{mailbox_key, encode_mailbox_message};
+pub use dht::{mailbox_index_key, mailbox_seq_key, parse_user_hash_from_key, encode_mailbox_message, decode_mailbox_message, encode_index, decode_index};

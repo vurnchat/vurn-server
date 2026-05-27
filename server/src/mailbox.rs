@@ -1,115 +1,210 @@
-//! # DHT-backed Mailbox
+//! # DHT-backed Mailbox with Local Sled Backup
 //!
-//! Stores offline messages in the Kademlia DHT instead of local memory.
+//! Stores offline messages in the Kademlia DHT and backs them up locally
+//! in a Sled embedded database for durability.
 //!
-//! When a user comes online, they query the DHT at `vmb_` + their hash
-//! to retrieve any messages stored while they were offline.
-//! The DHT automatically replicates mailbox data across nodes.
+//! ## Flow
+//! 1. Message arrives for offline user
+//! 2. `MailboxManager::store_message()` writes to Sled, then sends `MailboxStore` command
+//! 3. On user reconnect: `MailboxRetrieve` triggers DHT lookup
+//! 4. Retrieved messages are persisted to Sled via `backup_retrieved()`
+//! 5. If DHT lookup fails, Sled provides fallback
 
-use crate::p2p::{P2PNode, NodeCommand, mailbox_key, encode_mailbox_message};
+use crate::p2p::{NodeCommand, dht};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{info, warn};
 
-/// Shared mailbox state: pending DHT lookups by key.
-#[derive(Default)]
-struct MailboxState {
-    pending_retrievals: Vec<Vec<u8>>,
-}
+/// Prefix for Sled-tree namespacing
+const SLED_MAILBOX_TREE: &str = "mailbox";
 
-/// Bridges WebSocket mailbox events to DHT operations.
+/// Shared mailbox manager with Sled backup.
 pub struct MailboxManager {
-    state: Arc<RwLock<MailboxState>>,
-    #[allow(dead_code)]
+    db: Arc<sled::Db>,
     cmd_tx: mpsc::Sender<NodeCommand>,
+    /// Tracks keys with in-flight retrievals to avoid duplicates
+    pending_retrievals: Arc<RwLock<Vec<Vec<u8>>>>,
 }
 
 impl MailboxManager {
-    pub fn new(p2p_node: &P2PNode) -> Self {
+    /// Create a new MailboxManager with Sled storage at `db_path`.
+    ///
+    /// The database is opened at the given path; it will be created if it
+    /// doesn't exist. The mailbox manager will use the P2P command channel
+    /// for DHT operations.
+    pub fn new(db_path: &str, p2p_cmd_tx: mpsc::Sender<NodeCommand>) -> Self {
+        let db = sled::open(db_path).unwrap_or_else(|e| {
+            warn!("Failed to open Sled DB at {db_path}: {e}, using in-memory fallback");
+            sled::Config::new().temporary(true).open().expect("In-memory sled")
+        });
+        info!("MailboxManager: Sled DB opened at {db_path}");
         Self {
-            state: Arc::default(),
-            cmd_tx: p2p_node.cmd_tx.clone(),
+            db: Arc::new(db),
+            cmd_tx: p2p_cmd_tx,
+            pending_retrievals: Arc::default(),
         }
     }
 
-    /// Store a message for an offline recipient via DHT.
-    #[allow(dead_code)]
+    /// Store a message: write to Sled + send to DHT.
     pub async fn store_message(
         &self,
         recipient_hash: &[u8],
         sender_hash: &[u8],
         encrypted_payload: &[u8],
     ) {
-        let msg = encode_mailbox_message(sender_hash, encrypted_payload);
-        let key = mailbox_key(recipient_hash);
+        let msg = dht::encode_mailbox_message(sender_hash, encrypted_payload);
 
-        let cmd = NodeCommand::DhtStore {
-            key: key.to_vec(),
-            value: msg,
+        // 1. Write to local Sled backup (ignore errors — DHT is primary)
+        if let Err(e) = self.write_sled_mailbox(recipient_hash, sender_hash, encrypted_payload) {
+            warn!("Sled mailbox backup write failed: {e}");
+        }
+
+        // 2. Send sequential MailboxStore command to DHT via P2P node
+        let cmd = NodeCommand::MailboxStore {
+            recipient_hash: recipient_hash.to_vec(),
+            sender_hash: sender_hash.to_vec(),
+            payload: encrypted_payload.to_vec(),
         };
 
         if let Err(e) = self.cmd_tx.send(cmd).await {
-            warn!("Failed to send DHT store command: {e}");
+            warn!("Failed to send MailboxStore command: {e}");
         } else {
             info!(
-                "Mailbox: stored message in DHT for recipient {}",
+                "Mailbox: stored message in DHT + Sled for {}",
                 hex_fmt(recipient_hash, 8)
             );
         }
     }
 
-    /// Retrieve messages from the DHT for a user who just connected.
-    #[allow(dead_code)]
+    /// Request retrieval of messages from DHT for a user who just connected.
     pub async fn retrieve_messages(&self, user_hash: &[u8]) {
-        let key = mailbox_key(user_hash);
-
+        // Dedup: skip if retrieval is already in flight
         {
-            let mut state = self.state.write().await;
-            if state.pending_retrievals.iter().any(|k| k == &key.to_vec()) {
+            let pending = self.pending_retrievals.read().await;
+            if pending.iter().any(|k| k == user_hash) {
                 info!("Mailbox: retrieval already in flight for {}", hex_fmt(user_hash, 8));
                 return;
             }
-            state.pending_retrievals.push(key.to_vec());
         }
 
-        let cmd = NodeCommand::DhtGet { key: key.to_vec() };
+        {
+            let mut pending = self.pending_retrievals.write().await;
+            pending.push(user_hash.to_vec());
+        }
+
+        let cmd = NodeCommand::MailboxRetrieve {
+            user_hash: user_hash.to_vec(),
+        };
 
         if let Err(e) = self.cmd_tx.send(cmd).await {
-            warn!("Failed to send DHT get command: {e}");
+            warn!("Failed to send MailboxRetrieve command: {e}");
+            let mut pending = self.pending_retrievals.write().await;
+            pending.retain(|k| k != user_hash);
         } else {
             info!("Mailbox: requesting DHT messages for {}", hex_fmt(user_hash, 8));
         }
     }
 
-    /// Handles a DHT retrieval result from the P2P event loop.
+    /// Handle a DHT retrieval result — persist to Sled and return messages.
     pub async fn handle_retrieval_result(
         &self,
-        key: Vec<u8>,
-        value: Option<Vec<u8>>,
-    ) -> Option<Vec<Vec<u8>>> {
+        user_hash: &[u8],
+        messages: &[Vec<u8>],
+    ) -> Vec<Vec<u8>> {
+        // Clear pending flag
         {
-            let mut state = self.state.write().await;
-            state.pending_retrievals.retain(|k| k != &key);
+            let mut pending = self.pending_retrievals.write().await;
+            pending.retain(|k| k != user_hash);
         }
 
-        match value {
-            Some(data) => {
-                info!(
-                    "Mailbox: retrieved {} bytes from DHT for key {}",
-                    data.len(),
-                    hex_fmt(&key, 8)
-                );
-                Some(vec![data])
+        // Persist to Sled for durability
+        for msg in messages {
+            if let Err(e) = self.write_sled_raw(user_hash, msg) {
+                warn!("Sled backup write failed for retrieval: {e}");
             }
-            None => {
-                info!("Mailbox: no messages found in DHT for key {}", hex_fmt(&key, 8));
-                None
+        }
+
+        info!(
+            "Mailbox: retrieved {} messages from DHT for {}",
+            messages.len(),
+            hex_fmt(user_hash, 8)
+        );
+
+        messages.to_vec()
+    }
+
+    /// Backup messages that were retrieved via DHT (called from main.rs event handler).
+    pub async fn backup_retrieved(&self, user_hash: &[u8], messages: &[Vec<u8>]) {
+        for msg in messages {
+            if let Err(e) = self.write_sled_raw(user_hash, msg) {
+                warn!("Sled backup_retrieved failed: {e}");
             }
         }
     }
+
+    /// Get all stored messages from local Sled backup (fallback if DHT is unavailable).
+    #[allow(dead_code)]
+    pub async fn get_sled_backup(&self, user_hash: &[u8]) -> Vec<Vec<u8>> {
+        let tree = match self.db.open_tree(SLED_MAILBOX_TREE) {
+            Ok(t) => t,
+            Err(_) => return vec![],
+        };
+
+        let prefix = user_hash.to_vec();
+        let mut messages = vec![];
+
+        for result in tree.scan_prefix(&prefix) {
+            match result {
+                Ok((_key, value)) => {
+                    messages.push(value.to_vec());
+                }
+                Err(e) => {
+                    warn!("Sled scan error: {e}");
+                }
+            }
+        }
+
+        messages
+    }
+
+    // ── Sled helpers ──
+
+    fn write_sled_mailbox(
+        &self,
+        user_hash: &[u8],
+        sender_hash: &[u8],
+        payload: &[u8],
+    ) -> Result<(), sled::Error> {
+        let tree = self.db.open_tree(SLED_MAILBOX_TREE)?;
+        let msg = dht::encode_mailbox_message(sender_hash, payload);
+
+        // Use a timestamp-based key to avoid collisions
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        let key = [user_hash, &ts.to_le_bytes()].concat();
+
+        tree.insert(key, msg)?;
+        tree.flush()?;
+        Ok(())
+    }
+
+    fn write_sled_raw(&self, user_hash: &[u8], data: &[u8]) -> Result<(), sled::Error> {
+        let tree = self.db.open_tree(SLED_MAILBOX_TREE)?;
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        let key = [user_hash, &ts.to_le_bytes()].concat();
+        tree.insert(key, data)?;
+        tree.flush()?;
+        Ok(())
+    }
 }
 
-/// Format bytes as hex for logging (truncated).
+// ── Helper ──────────────────────────────────────────────────────────
+
 fn hex_fmt(bytes: &[u8], max: usize) -> String {
     let len = bytes.len().min(max);
     let s: String = bytes[..len].iter().map(|b| format!("{b:02x}")).collect();
@@ -117,19 +212,5 @@ fn hex_fmt(bytes: &[u8], max: usize) -> String {
         format!("{s}…({}b)", bytes.len())
     } else {
         format!("{s}({}b)", bytes.len())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_mailbox_key_format() {
-        let hash = b"12345678901234567890123456789012";
-        let key = mailbox_key(hash);
-        let kb = key.to_vec();
-        assert!(kb.starts_with(b"vmb_"));
-        assert_eq!(&kb[4..], hash);
     }
 }

@@ -2,12 +2,27 @@
 //!
 //! Core libp2p node for VurnChat's distributed network layer.
 //!
-//! Sets up the Swarm with:
-//! - **Kademlia DHT** — peer discovery, mailbox storage/retrieval
-//! - **GossipSub** — topic-based broadcast (future group chats)
-//! - **Ping** — keepalive and liveness checks
+//! ## Sequential Mailbox Keys
+//!
+//! - `vmb_<hash>_<seq>` — stores individual message (seq = 1, 2, 3...)
+//! - `vmb_<hash>_index` — DHT hint for the current max seq
+//!
+//! ## MailboxStore (synchronous)
+//!
+//! Uses an in-memory `HashMap<Vec<u8>, u64>` to track the current index.
+//! This avoids the two-phase DHT problem (get index → store).
+//!
+//! 1. Read index from HashMap (or 0)
+//! 2. Increment, store message at seq key in DHT
+//! 3. Also write index to DHT as a hint for other nodes
+//!
+//! ## MailboxRetrieve (DHT state machine)
+//!
+//! 1. DHT get_record for `vmb_<hash>_index` → get index
+//! 2. For seq = 1..=index: DHT get_record for each seq key
+//! 3. Collect results, emit MailboxRetrieved when done
 
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 use futures::StreamExt;
 use kad::store::MemoryStore;
 use libp2p::{
@@ -19,14 +34,10 @@ use tracing::{info, warn, trace};
 
 use libp2p::{kad, gossipsub, identify};
 
+use crate::p2p::dht;
+
 // ── Composed behaviour ──────────────────────────────────────────────
 
-/// All libp2p behaviours combined via the derive macro.
-///
-/// `to_swarm` attribute tells the derive macro to use our custom
-/// `NodeBehaviourEvent` type instead of generating an anonymous enum.
-/// The derive macro requires `From<SubBehaviour::ToSwarm>` impls for
-/// each field's event type.
 #[derive(libp2p::swarm::NetworkBehaviour)]
 #[behaviour(to_swarm = "NodeBehaviourEvent")]
 pub struct NodeBehaviour {
@@ -36,10 +47,6 @@ pub struct NodeBehaviour {
     pub ping: libp2p::ping::Behaviour,
 }
 
-/// Custom event type for the composed behaviour.
-///
-/// We define this explicitly to avoid matching on generated associated types.
-/// Each variant mirrors one sub-behaviour's ToSwarm event type.
 #[derive(Debug)]
 pub enum NodeBehaviourEvent {
     Kademlia(kad::Event),
@@ -48,66 +55,62 @@ pub enum NodeBehaviourEvent {
     Ping(libp2p::ping::Event),
 }
 
-// ── From impls required by the derive macro ─────────────────────────
-
 impl From<kad::Event> for NodeBehaviourEvent {
-    fn from(e: kad::Event) -> Self {
-        NodeBehaviourEvent::Kademlia(e)
-    }
+    fn from(e: kad::Event) -> Self { NodeBehaviourEvent::Kademlia(e) }
 }
-
 impl From<gossipsub::Event> for NodeBehaviourEvent {
-    fn from(e: gossipsub::Event) -> Self {
-        NodeBehaviourEvent::Gossipsub(e)
-    }
+    fn from(e: gossipsub::Event) -> Self { NodeBehaviourEvent::Gossipsub(e) }
 }
-
 impl From<identify::Event> for NodeBehaviourEvent {
-    fn from(e: identify::Event) -> Self {
-        NodeBehaviourEvent::Identify(e)
-    }
+    fn from(e: identify::Event) -> Self { NodeBehaviourEvent::Identify(e) }
 }
-
 impl From<libp2p::ping::Event> for NodeBehaviourEvent {
-    fn from(e: libp2p::ping::Event) -> Self {
-        NodeBehaviourEvent::Ping(e)
-    }
+    fn from(e: libp2p::ping::Event) -> Self { NodeBehaviourEvent::Ping(e) }
 }
 
 // ── Events & Commands ──────────────────────────────────────────────
 
-/// Events emitted by the P2P node's event loop.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub enum NodeEvent {
-    /// A message was received (from direct or gossipsub)
     MessageReceived { from: PeerId, data: Vec<u8> },
-    /// DHT record retrieved
-    MailboxRetrieved { key: Vec<u8>, value: Option<Vec<u8>> },
-    /// A new peer was discovered
+    MailboxRetrieved { user_hash: Vec<u8>, messages: Vec<Vec<u8>> },
     PeerDiscovered(PeerId),
-    /// Listen address the node is accepting connections on
     ListeningOn(Multiaddr),
-    /// An error occurred
     Error(String),
 }
 
-/// Commands that can be sent to the P2P node.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub enum NodeCommand {
-    /// Store a value in the DHT at the given key.
     DhtStore { key: Vec<u8>, value: Vec<u8> },
-    /// Retrieve a value from the DHT by key.
     DhtGet { key: Vec<u8> },
-    /// Dial a specific peer address (bootstrap).
+    /// Store in sequential mailbox — uses in-memory index, synchronous.
+    MailboxStore { recipient_hash: Vec<u8>, sender_hash: Vec<u8>, payload: Vec<u8> },
+    /// Retrieve all messages — uses DHT state machine.
+    MailboxRetrieve { user_hash: Vec<u8> },
     Dial { addr: Multiaddr },
-    /// Subscribe to a GossipSub topic.
     Subscribe { topic: String },
-    /// Publish on a GossipSub topic.
     Publish { topic: String, data: Vec<u8> },
-    /// Bootstrap the DHT
     Bootstrap,
+}
+
+// ── Internal state machine ──────────────────────────────────────────
+
+enum MailboxState {
+    Idle,
+    /// Waiting for index DHT response to begin retrieval.
+    Retrieving { user_hash: Vec<u8> },
+    /// Collecting individual seq messages after index was obtained.
+    Collecting {
+        user_hash: Vec<u8>,
+        messages: Vec<Vec<u8>>,
+        remaining: Vec<u64>,
+    },
+}
+
+impl MailboxState {
+    fn is_idle(&self) -> bool {
+        matches!(self, MailboxState::Idle)
+    }
 }
 
 // ── Node struct ─────────────────────────────────────────────────────
@@ -120,7 +123,6 @@ pub struct P2PNode {
 }
 
 impl P2PNode {
-    /// Creates and starts a new P2P node.
     pub async fn new(
         listen_addr: &str,
         event_tx: mpsc::Sender<NodeEvent>,
@@ -184,14 +186,20 @@ impl P2PNode {
 
         let handle = tokio::spawn(async move {
             let ev_tx = event_tx;
+            let mut mailbox_state = MailboxState::Idle;
+            // In-memory index counter: recipient_hash → current max seq
+            let mut mailbox_indices: HashMap<Vec<u8>, u64> = HashMap::new();
+
             loop {
                 tokio::select! {
                     event = swarm.select_next_some() => {
-                        handle_swarm_event(event, &ev_tx).await;
+                        mailbox_state = handle_swarm_event(event, &ev_tx, &mut swarm, mailbox_state).await;
                     }
                     cmd = cmd_rx.recv() => {
                         let Some(cmd) = cmd else { break; };
-                        handle_command(&mut swarm, cmd).await;
+                        mailbox_state = handle_command(
+                            &mut swarm, cmd, &ev_tx, mailbox_state, &mut mailbox_indices,
+                        ).await;
                     }
                 }
             }
@@ -207,21 +215,24 @@ impl P2PNode {
 
 // ── Event handling ─────────────────────────────────────────────────
 
-/// Process a SwarmEvent and dispatch to behaviour-specific handlers.
 async fn handle_swarm_event(
     event: SwarmEvent<NodeBehaviourEvent>,
     ev_tx: &mpsc::Sender<NodeEvent>,
-) {
+    swarm: &mut libp2p::Swarm<NodeBehaviour>,
+    mailbox_state: MailboxState,
+) -> MailboxState {
     match event {
         SwarmEvent::Behaviour(be) => match be {
             NodeBehaviourEvent::Kademlia(kad_event) => {
-                handle_kad_event(kad_event, ev_tx).await;
+                handle_kad_event(kad_event, ev_tx, swarm, mailbox_state).await
             }
             NodeBehaviourEvent::Gossipsub(gs_event) => {
-                handle_gossipsub_event(gs_event, ev_tx).await;
+                handle_gossipsub_event(gs_event, ev_tx);
+                mailbox_state
             }
             NodeBehaviourEvent::Identify(identify_event) => {
                 handle_identify_event(identify_event, ev_tx).await;
+                mailbox_state
             }
             NodeBehaviourEvent::Ping(ping_event) => {
                 if ping_event.result.is_ok() {
@@ -229,90 +240,224 @@ async fn handle_swarm_event(
                 } else {
                     trace!("Ping failed: peer={}", ping_event.peer);
                 }
+                mailbox_state
             }
         },
         SwarmEvent::NewListenAddr { address, .. } => {
             info!("P2P listening on {address}");
             let _ = ev_tx.send(NodeEvent::ListeningOn(address)).await;
+            mailbox_state
         }
         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
             let _ = ev_tx.send(NodeEvent::PeerDiscovered(peer_id)).await;
+            mailbox_state
         }
         SwarmEvent::ConnectionClosed { peer_id, .. } => {
             info!("P2P connection closed: {peer_id}");
+            mailbox_state
         }
         SwarmEvent::IncomingConnectionError { error, .. } => {
             trace!("Incoming connection error: {error}");
+            mailbox_state
         }
         other => {
             trace!("P2P event: {other:?}");
+            mailbox_state
         }
     }
 }
 
-/// Handle Kademlia events (DHT operations).
 async fn handle_kad_event(
     event: kad::Event,
     ev_tx: &mpsc::Sender<NodeEvent>,
-) {
-    info!("KAD_EVENT: {event:?}");
+    swarm: &mut libp2p::Swarm<NodeBehaviour>,
+    mut state: MailboxState,
+) -> MailboxState {
     match event {
-        kad::Event::OutboundQueryProgressed { result, id, stats, .. } => {
+        kad::Event::OutboundQueryProgressed { result, .. } => {
             use kad::QueryResult;
-            info!("KAD QueryResult [{id:?} stats={stats:?}]: {result:?}");
             match result {
                 QueryResult::GetRecord(Ok(ok)) => match ok {
                     kad::GetRecordOk::FoundRecord(peer_record) => {
                         let key = peer_record.record.key.to_vec();
-                        let value = peer_record.record.value.clone();
-                        let key_hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
-                        info!("DHT get_record FOUND: key={} value_len={}", key_hex, value.len());
-                        let _ = ev_tx
-                            .send(NodeEvent::MailboxRetrieved {
-                                key,
-                                value: Some(value),
-                            })
-                            .await;
+                        let value = Some(peer_record.record.value.clone());
+                        handle_get_record_response(key, value, ev_tx, swarm, &mut state).await
                     }
                     kad::GetRecordOk::FinishedWithNoAdditionalRecord { .. } => {
-                        info!("DHT get_record finished (no more records)");
+                        // Key not found in DHT.
+                        // For Retrieving: treat as index = 0 → emit empty.
+                        // For Collecting: treat seq as not found → skip.
+                        match &state {
+                            MailboxState::Retrieving { user_hash } => {
+                                info!("MailboxRetrieve: no index found in DHT for {}",
+                                    hex_fmt(user_hash, 8));
+                                let _ = ev_tx.send(NodeEvent::MailboxRetrieved {
+                                    user_hash: user_hash.clone(),
+                                    messages: vec![],
+                                }).await;
+                                state = MailboxState::Idle;
+                            }
+                            MailboxState::Collecting { user_hash, messages, remaining } => {
+                                // The "not found" is for a seq that doesn't exist.
+                                // Skip it and continue with the next.
+                                let mut remaining = remaining.clone();
+                                let mut messages = messages.clone();
+                                if !remaining.is_empty() {
+                                    remaining.remove(0);
+                                }
+                                if remaining.is_empty() {
+                                    let _ = ev_tx.send(NodeEvent::MailboxRetrieved {
+                                        user_hash: user_hash.clone(),
+                                        messages: messages.clone(),
+                                    }).await;
+                                    state = MailboxState::Idle;
+                                } else {
+                                    let next_seq = remaining[0];
+                                    let seq_key = dht::mailbox_seq_key(user_hash, next_seq);
+                                    swarm.behaviour_mut().kademlia.get_record(seq_key);
+                                    state = MailboxState::Collecting {
+                                        user_hash: user_hash.clone(),
+                                        messages: messages.clone(),
+                                        remaining,
+                                    };
+                                }
+                            }
+                            MailboxState::Idle => {
+                                // Standalone DHT get — not found is normal
+                                state = MailboxState::Idle;
+                            }
+                        }
+                        state
                     }
                 },
                 QueryResult::GetRecord(Err(e)) => {
                     warn!("DHT get_record failed: {e:?}");
+                    if !state.is_idle() {
+                        state = MailboxState::Idle;
+                    }
+                    state
                 }
                 QueryResult::PutRecord(Ok(ok)) => {
-                    info!("DHT put_record succeeded: {ok:?}");
+                    trace!("DHT put_record succeeded: {ok:?}");
+                    state
                 }
                 QueryResult::PutRecord(Err(e)) => {
                     warn!("DHT put_record failed: {e:?}");
+                    state
                 }
                 QueryResult::Bootstrap(Ok(ok)) => {
-                    info!("DHT bootstrap completed: {ok:?}");
+                    trace!("DHT bootstrap completed: {ok:?}");
+                    state
                 }
                 QueryResult::Bootstrap(Err(e)) => {
                     warn!("DHT bootstrap failed: {e:?}");
+                    state
                 }
-                QueryResult::StartProviding(Ok(_)) => {}
-                QueryResult::StartProviding(Err(e)) => {
-                    warn!("DHT start_providing failed: {e:?}");
-                }
-                _ => {
-                    info!("KAD unhandled query result: {result:?}");
-                }
+                _ => state,
             }
         }
         kad::Event::RoutingUpdated { peer, .. } => {
-            info!("KAD routing updated: {peer}");
             let _ = ev_tx.send(NodeEvent::PeerDiscovered(peer)).await;
+            state
         }
-        // Inbound queries are handled automatically by Kademlia
-        _ => {}
+        _ => state,
     }
 }
 
-/// Handle Identify events (peer info exchange).
-/// Identify automatically populates Kademlia routing tables.
+/// Process a GetRecord response in the context of the mailbox state machine.
+async fn handle_get_record_response(
+    key: Vec<u8>,
+    value: Option<Vec<u8>>,
+    ev_tx: &mpsc::Sender<NodeEvent>,
+    swarm: &mut libp2p::Swarm<NodeBehaviour>,
+    state: &mut MailboxState,
+) -> MailboxState {
+    match state {
+        // ── Retrieving: got index, start collecting seq messages ──
+        MailboxState::Retrieving { user_hash } => {
+            let current_index = value.as_deref().map(dht::decode_index).unwrap_or(0);
+            if current_index == 0 {
+                info!("MailboxRetrieve: index=0 for {}", hex_fmt(user_hash, 8));
+                let _ = ev_tx.send(NodeEvent::MailboxRetrieved {
+                    user_hash: user_hash.clone(),
+                    messages: vec![],
+                }).await;
+                return MailboxState::Idle;
+            }
+
+            info!(
+                "MailboxRetrieve: index={}, fetching {} msgs for {}",
+                current_index, current_index, hex_fmt(user_hash, 8)
+            );
+
+            let remaining: Vec<u64> = (1..=current_index).collect();
+            let first_seq = remaining[0];
+            let seq_key = dht::mailbox_seq_key(user_hash, first_seq);
+            swarm.behaviour_mut().kademlia.get_record(seq_key);
+
+            MailboxState::Collecting {
+                user_hash: user_hash.clone(),
+                messages: vec![],
+                remaining,
+            }
+        }
+
+        // ── Collecting: got a seq message, add to collection ──
+        MailboxState::Collecting { user_hash, messages, remaining } => {
+            if remaining.is_empty() {
+                let msgs = messages.clone();
+                let _ = ev_tx.send(NodeEvent::MailboxRetrieved {
+                    user_hash: user_hash.clone(),
+                    messages: msgs,
+                }).await;
+                return MailboxState::Idle;
+            }
+
+            let seq = remaining[0];
+            if let Some(data) = value {
+                messages.push(data);
+                info!("MailboxRetrieve: collected seq {seq} for {}", hex_fmt(user_hash, 8));
+            } else {
+                info!("MailboxRetrieve: seq {seq} not found in DHT for {}", hex_fmt(user_hash, 8));
+            }
+            remaining.remove(0);
+
+            if remaining.is_empty() {
+                let msgs = messages.clone();
+                let _ = ev_tx.send(NodeEvent::MailboxRetrieved {
+                    user_hash: user_hash.clone(),
+                    messages: msgs,
+                }).await;
+                MailboxState::Idle
+            } else {
+                let next_seq = remaining[0];
+                let seq_key = dht::mailbox_seq_key(user_hash, next_seq);
+                swarm.behaviour_mut().kademlia.get_record(seq_key);
+                MailboxState::Collecting {
+                    user_hash: user_hash.clone(),
+                    messages: messages.clone(),
+                    remaining: remaining.clone(),
+                }
+            }
+        }
+
+        // ── Idle: standalone DHT get_record result ──
+        MailboxState::Idle => {
+            let user_hash = dht::parse_user_hash_from_key(&key)
+                .map(|h| h.to_vec())
+                .unwrap_or_default();
+            let msgs = value.map(|v| vec![v]).unwrap_or_default();
+            let _ = ev_tx.send(NodeEvent::MailboxRetrieved {
+                user_hash,
+                messages: msgs,
+            }).await;
+            MailboxState::Idle
+        }
+    }
+}
+
+// ── Identify ────────────────────────────────────────────────────────
+
 async fn handle_identify_event(
     event: identify::Event,
     ev_tx: &mpsc::Sender<NodeEvent>,
@@ -323,20 +468,13 @@ async fn handle_identify_event(
                 info.agent_version, info.protocols);
             let _ = ev_tx.send(NodeEvent::PeerDiscovered(peer_id)).await;
         }
-        identify::Event::Sent { peer_id, .. } => {
-            trace!("Identify sent to {peer_id}");
-        }
-        identify::Event::Pushed { peer_id, .. } => {
-            trace!("Identify pushed to {peer_id}");
-        }
-        identify::Event::Error { peer_id, error, .. } => {
-            warn!("Identify error with {peer_id}: {error}");
-        }
+        _ => {}
     }
 }
 
-/// Handle GossipSub events (pub/sub messages).
-async fn handle_gossipsub_event(
+// ── GossipSub ───────────────────────────────────────────────────────
+
+fn handle_gossipsub_event(
     event: gossipsub::Event,
     ev_tx: &mpsc::Sender<NodeEvent>,
 ) {
@@ -346,19 +484,23 @@ async fn handle_gossipsub_event(
         ..
     } = event
     {
-        let _ = ev_tx
-            .send(NodeEvent::MessageReceived {
-                from: propagation_source,
-                data: message.data,
-            })
-            .await;
+        let _ = ev_tx.send(NodeEvent::MessageReceived {
+            from: propagation_source,
+            data: message.data,
+        });
     }
 }
 
 // ── Command handling ────────────────────────────────────────────────
 
-/// Process a NodeCommand by calling the appropriate method on the swarm.
-async fn handle_command(swarm: &mut libp2p::Swarm<NodeBehaviour>, cmd: NodeCommand) {
+#[allow(clippy::too_many_arguments)]
+async fn handle_command(
+    swarm: &mut libp2p::Swarm<NodeBehaviour>,
+    cmd: NodeCommand,
+    _ev_tx: &mpsc::Sender<NodeEvent>,
+    mailbox_state: MailboxState,
+    mailbox_indices: &mut HashMap<Vec<u8>, u64>,
+) -> MailboxState {
     let NodeBehaviour {
         ref mut kademlia,
         ref mut gossipsub,
@@ -369,7 +511,10 @@ async fn handle_command(swarm: &mut libp2p::Swarm<NodeBehaviour>, cmd: NodeComma
     match cmd {
         NodeCommand::Dial { addr } => {
             let _ = swarm.dial(addr);
+            mailbox_state
         }
+
+        // ── Raw DHT operations ──
         NodeCommand::DhtStore { key, value } => {
             use kad::Record;
             let record = Record {
@@ -378,21 +523,99 @@ async fn handle_command(swarm: &mut libp2p::Swarm<NodeBehaviour>, cmd: NodeComma
                 publisher: None,
                 expires: None,
             };
-            // Use Quorum::One for fast writes — Kademlia will replicate
-            // to the K closest nodes during background maintenance.
             let _ = kademlia.put_record(record, kad::Quorum::One);
+            mailbox_state
         }
         NodeCommand::DhtGet { key } => {
             kademlia.get_record(kad::RecordKey::new(&key));
+            mailbox_state
         }
+
+        // ── MailboxStore: synchronous via in-memory index ──
+        NodeCommand::MailboxStore { recipient_hash, sender_hash, payload } => {
+            use kad::Record;
+
+            let current_index = mailbox_indices.get(&recipient_hash).copied().unwrap_or(0);
+            let new_index = current_index + 1;
+
+            // 1. Store message at vmb_<hash>_<seq>
+            let seq_key = dht::mailbox_seq_key(&recipient_hash, new_index);
+            let msg = dht::encode_mailbox_message(&sender_hash, &payload);
+            let _ = kademlia.put_record(
+                Record {
+                    key: seq_key,
+                    value: msg,
+                    publisher: None,
+                    expires: None,
+                },
+                kad::Quorum::One,
+            );
+
+            // 2. Update in-memory index
+            mailbox_indices.insert(recipient_hash.clone(), new_index);
+
+            // 3. Write index hint to DHT (best-effort, for cross-node retrieval)
+            let index_key = dht::mailbox_index_key(&recipient_hash);
+            let idx_bytes = dht::encode_index(new_index);
+            let _ = kademlia.put_record(
+                Record {
+                    key: index_key,
+                    value: idx_bytes,
+                    publisher: None,
+                    expires: None,
+                },
+                kad::Quorum::One,
+            );
+
+            info!(
+                "MailboxStore: seq {new_index} (in-mem) for {}",
+                hex_fmt(&recipient_hash, 8)
+            );
+
+            mailbox_state
+        }
+
+        // ── MailboxRetrieve: DHT state machine ──
+        NodeCommand::MailboxRetrieve { user_hash } => {
+            if !mailbox_state.is_idle() {
+                warn!("MailboxRetrieve: previous operation still in progress, dropping");
+                return mailbox_state;
+            }
+
+            info!(
+                "MailboxRetrieve: querying DHT index for {}",
+                hex_fmt(&user_hash, 8)
+            );
+            let index_key = dht::mailbox_index_key(&user_hash);
+            kademlia.get_record(index_key);
+
+            MailboxState::Retrieving { user_hash }
+        }
+
+        // ── GossipSub ──
         NodeCommand::Subscribe { topic } => {
             let _ = gossipsub.subscribe(&gossipsub::IdentTopic::new(topic));
+            mailbox_state
         }
         NodeCommand::Publish { topic, data } => {
             let _ = gossipsub.publish(gossipsub::TopicHash::from_raw(topic), data);
+            mailbox_state
         }
         NodeCommand::Bootstrap => {
             let _ = kademlia.bootstrap();
+            mailbox_state
         }
+    }
+}
+
+// ── Helper ──────────────────────────────────────────────────────────
+
+fn hex_fmt(bytes: &[u8], max: usize) -> String {
+    let len = bytes.len().min(max);
+    let s: String = bytes[..len].iter().map(|b| format!("{b:02x}")).collect();
+    if bytes.len() > max {
+        format!("{s}…({}b)", bytes.len())
+    } else {
+        format!("{s}({}b)", bytes.len())
     }
 }
