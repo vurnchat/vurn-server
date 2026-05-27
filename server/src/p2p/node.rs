@@ -160,6 +160,12 @@ pub struct P2PNode {
 }
 
 impl P2PNode {
+    /// Maximum dial-backoff delay in seconds.
+    const MAX_RECONNECT_DELAY_SECS: u64 = 60;
+
+    /// Sled tree name for persisting peer addresses.
+    const SLED_PEER_TREE: &str = "peers";
+
     pub async fn new(
         listen_addr: &str,
         event_tx: mpsc::Sender<NodeEvent>,
@@ -219,7 +225,34 @@ impl P2PNode {
                     ping,
                 }
             })?
-            .build();
+            .build();            // ── Load persisted peers from Sled and re-dial (batched) ──
+            // Batch-dial saved peers in small groups with 500ms spacing to avoid
+            // overwhelming the libp2p dialer on startup.
+            {
+                let mut persisted: Vec<Multiaddr> = Vec::new();
+                if let Some(peer_tree) = sled_db.open_tree(Self::SLED_PEER_TREE).ok() {
+                    for result in peer_tree.iter() {
+                        if let Ok((_key_bytes, val_bytes)) = result {
+                            if let Ok(addrs) = bincode::deserialize::<Vec<Multiaddr>>(&val_bytes) {
+                                // Take at most 1 addr per peer to keep dials manageable
+                                if let Some(addr) = addrs.first().cloned() {
+                                    persisted.push(addr);
+                                }
+                            }
+                        }
+                    }
+                }
+                // Dial in batches of 5, 500ms apart
+                for chunk in persisted.chunks(5) {
+                    for addr in chunk {
+                        info!("P2P: dialing persisted peer at {addr}");
+                        if let Err(e) = swarm.dial(addr.clone()) {
+                            trace!("Dial persisted peer failed: {e}");
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            }
 
         swarm.listen_on(listen_addr.parse()?)?;
 
@@ -230,19 +263,61 @@ impl P2PNode {
             let mut mailbox_state = MailboxState::Idle;
             let mut mailbox_indices: HashMap<Vec<u8>, u64> = HashMap::new();
 
+            // ── Known peers for P2P reconnect ──
+            // Known P2P peers (from connection_established, routing, identify).
+            // On ConnectionClosed, we try to re-dial with per-peer exponential backoff.
+            // Map: peer → (attempt_count, last_dial_instant)
+            let mut known_peers: HashMap<PeerId, (u32, Instant)> = HashMap::new();
+            // Also store discovered multiaddrs per peer so we can re-dial
+            let mut peer_addrs: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
+
             // Timeout polling: every 5 seconds, check if FetchingIndex or
             // CollectingMessages has expired.
             let mut timeout_tick = tokio::time::interval(Duration::from_secs(5));
+
+            // Reconnect check: every 10 seconds, try re-dialing known peers
+            let mut reconnect_tick = tokio::time::interval(Duration::from_secs(10));
 
             loop {
                 tokio::select! {
                     _ = timeout_tick.tick() => {
                         mailbox_state = check_state_timeout(mailbox_state, &ev_tx);
                     }
+                    _ = reconnect_tick.tick() => {
+                        // Only re-dial peers that are NOT currently connected
+                        let connected: Vec<PeerId> = swarm.connected_peers().copied().collect();
+                        let now = Instant::now();
+                        let mut to_redial = Vec::new();
+                        for (peer, addrs) in &peer_addrs {
+                            if connected.contains(peer) {
+                                // Already connected — reset attempt counter
+                                known_peers.insert(*peer, (0, now));
+                                continue;
+                            }
+                            let (attempt, last_time) = known_peers.get(peer).copied().unwrap_or((0, now));
+                            let delay_secs = (1u64 << attempt.min(6)).min(Self::MAX_RECONNECT_DELAY_SECS);
+                            let backoff = Duration::from_secs(delay_secs);
+                            // Only dial if backoff has elapsed since last attempt, or first attempt
+                            if attempt == 0 || now.duration_since(last_time) >= backoff {
+                                if let Some(addr) = addrs.first() {
+                                    to_redial.push((*peer, addr.clone()));
+                                }
+                            }
+                        }
+                        for (peer, addr) in &to_redial {
+                            info!("P2P reconnect: dialing {peer} at {addr}");
+                            if let Err(e) = swarm.dial(addr.clone()) {
+                                trace!("P2P reconnect dial failed for {peer}: {e}");
+                            }
+                            let (attempt, ..) = known_peers.get(peer).copied().unwrap_or((0, now));
+                            known_peers.insert(*peer, (attempt + 1, now));
+                        }
+                    }
                     event = swarm.select_next_some() => {
                         mailbox_state = handle_swarm_event(
                             event, &ev_tx, &mut swarm, mailbox_state,
                             &mut mailbox_indices, &signing_key,
+                            &mut known_peers, &mut peer_addrs, &sled_db,
                         ).await;
                         mailbox_state = check_state_timeout(mailbox_state, &ev_tx);
                     }
@@ -304,6 +379,9 @@ async fn handle_swarm_event(
     mailbox_state: MailboxState,
     mailbox_indices: &mut HashMap<Vec<u8>, u64>,
     signing_key: &SigningKey,
+    known_peers: &mut HashMap<PeerId, (u32, std::time::Instant)>,
+    peer_addrs: &mut HashMap<PeerId, Vec<Multiaddr>>,
+    sled_db: &sled::Db,
 ) -> MailboxState {
     match event {
         SwarmEvent::Behaviour(be) => match be {
@@ -332,12 +410,21 @@ async fn handle_swarm_event(
             let _ = ev_tx.send(NodeEvent::ListeningOn(address)).await;
             mailbox_state
         }
-        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+        SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+            info!("P2P connection established: {peer_id}");
+            known_peers.entry(peer_id).or_insert((0, Instant::now())); // reset attempt counter
+            // Store the remote address for re-dial and persist to Sled
+            let addr = endpoint.get_remote_address();
+            peer_addrs.entry(peer_id).or_default().push(addr.clone());
+            persist_peer_addr(&sled_db, &peer_id, &addr);
             let _ = ev_tx.send(NodeEvent::PeerDiscovered(peer_id)).await;
             mailbox_state
         }
         SwarmEvent::ConnectionClosed { peer_id, .. } => {
-            info!("P2P connection closed: {peer_id}");
+            info!("P2P connection closed: {peer_id}, will retry with backoff");
+            // Increment attempt counter on close so reconnect tick uses backoff
+            let (attempt, _) = known_peers.get(&peer_id).copied().unwrap_or((0, Instant::now()));
+            known_peers.insert(peer_id, (attempt + 1, Instant::now()));
             mailbox_state
         }
         SwarmEvent::IncomingConnectionError { error, .. } => {
@@ -1002,6 +1089,30 @@ fn get_sled_max_seq(db: &sled::Db, user_hash: &[u8]) -> Option<u64> {
         }
     }
     if max_seq > 0 { Some(max_seq) } else { None }
+}
+
+/// Persist a peer address to the Sled peer store for re-dial after restart.
+fn persist_peer_addr(db: &sled::Db, peer_id: &PeerId, addr: &Multiaddr) {
+    if let Ok(tree) = db.open_tree(P2PNode::SLED_PEER_TREE) {
+        let key = peer_id.to_string().into_bytes();
+        let mut addrs: Vec<Multiaddr> = tree
+            .get(&key)
+            .ok()
+            .flatten()
+            .and_then(|v| bincode::deserialize::<Vec<Multiaddr>>(&v).ok())
+            .unwrap_or_default();
+        // Avoid duplicates
+        if !addrs.contains(addr) {
+            addrs.push(addr.clone());
+        }
+        // Keep only the last 3 unique addrs per peer (cleanup)
+        if addrs.len() > 3 {
+            addrs = addrs[addrs.len() - 3..].to_vec();
+        }
+        if let Ok(bytes) = bincode::serialize(&addrs) {
+            let _ = tree.insert(key, bytes);
+        }
+    }
 }
 
 // ── Helper ──────────────────────────────────────────────────────────
