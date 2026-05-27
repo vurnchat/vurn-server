@@ -90,6 +90,12 @@ parse_args() {
 
 parse_args "$@"
 
+# If script is not attached to a terminal (e.g., piped from curl),
+# automatically switch to non‑interactive mode to avoid empty reads.
+if [ ! -t 0 ]; then
+    INTERACTIVE=false
+fi
+
 # ── Step 1: Welcome & environment check ─────────────────────────────
 echo ""
 header "┌─────────────────────────────────────────────────────────┐"
@@ -189,7 +195,9 @@ if [[ "$IS_LINUX" == "true" ]]; then
     else
         ok "System user vurn already exists"
     fi
-    $SUDO chown -R vurn:vurn "${STATE_DIR}"
+    if id -u vurn &>/dev/null; then
+    $SUDO chown -R vurn:vurn "${STATE_DIR}" "${CONFIG_DIR}"
+fi
 else
     # macOS — create directories without dedicated system user
     ok "Skipping system user creation (macOS)"
