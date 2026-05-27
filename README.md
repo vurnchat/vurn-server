@@ -245,12 +245,15 @@ cargo test -p vurn-core
 cargo run -p vurn-server
 
 # Custom port
-PORT=8081 cargo run -p vurn-server
+cargo run -p vurn-server -- --port 8081
+
+# With TLS (WSS)
+cargo run -p vurn-server -- --cert cert.pem --key key.pem
 ```
 
 You should see:
 ```
-VurnChat relay server starting on 0.0.0.0:9000
+VurnChat relay server starting on 0.0.0.0:9000 (WS mode)
 ```
 
 ### 3. Start the Web Client
@@ -283,6 +286,27 @@ Wait for the WASM build (~60-120 seconds first time), then:
 # Stop everything
 kill $(lsof -ti:9000)  # server
 kill $(lsof -ti:8080)  # web client
+```
+
+### Command-line reference
+
+```
+VurnChat Blind Relay Server
+
+Usage:
+  vurn-server [--port <PORT>] [--cert <CERT> --key <KEY>]
+
+Options:
+  --port <PORT>     Port to listen on (default: 9000)
+  --cert <CERT>     Path to TLS certificate PEM file
+  --key <KEY>       Path to TLS private key PEM file
+  --help, -h        Show this help message
+
+Examples:
+  vurn-server
+  vurn-server --port 8080
+  vurn-server --cert cert.pem --key key.pem
+  vurn-server --port 443 --cert /etc/letsencrypt/live/example.com/fullchain.pem --key /etc/letsencrypt/live/example.com/privkey.pem
 ```
 
 ---

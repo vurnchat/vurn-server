@@ -80,9 +80,18 @@ use axum::{
     routing::get,
     Router,
 };
+use hyper_util::rt::TokioIo;
+use tower_service::Service;
 use futures_util::{sink::SinkExt, stream::StreamExt};
 use rand::seq::SliceRandom;
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use rustls::{pki_types::PrivateKeyDer, ServerConfig};
+use std::{
+    collections::HashMap,
+    fs::File,
+    io::BufReader,
+    sync::Arc,
+    time::Duration,
+};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{error, info, warn};
 
@@ -169,13 +178,15 @@ fn hex_fmt(bytes: &[u8], max: usize) -> String {
 async fn main() {
     tracing_subscriber::fmt::init();
 
+    let args = CliArgs::parse();
+
     let state: SharedState = Arc::default();
 
     let cleanup_state = state.clone();
 
     let app = Router::new()
         .route("/ws", get(ws_handler))
-        .with_state(state);
+        .with_state(state.clone());
 
     // Spawn periodic mailbox cleanup to prevent unbounded memory growth
     // when a recipient never reconnects.
@@ -183,32 +194,67 @@ async fn main() {
         mailbox_cleanup_task(cleanup_state).await;
     });
 
-    let port: u16 = std::env::var("PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(9000);
+    let addr = format!("0.0.0.0:{}", args.port);
 
-    let addr = format!("0.0.0.0:{}", port);
-    info!("VurnChat relay server starting on {}", addr);
+    match args.mode {
+        ServerMode::Tls { cert_path, key_path } => {
+            info!("VurnChat relay server starting on {} (WSS mode)", addr);
+            info!("TLS: cert={}, key={}", cert_path, key_path);
 
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+            let tls_state = Arc::new(RwLock::new(
+                load_tls_config(&cert_path, &key_path)
+                    .await
+                    .expect("Failed to load initial TLS certificates"),
+            ));
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .unwrap();
+            // Spawn background task to reload certificates every 24 hours
+            let reload_state = tls_state.clone();
+            let reload_cert = cert_path.clone();
+            let reload_key = key_path.clone();
+            tokio::spawn(async move {
+                cert_reload_task(reload_state, &reload_cert, &reload_key).await;
+            });
+
+            run_tls_server(&addr, app, tls_state).await;
+        }
+        ServerMode::Plain => {
+            info!("VurnChat relay server starting on {} (WS mode)", addr);
+
+            let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+
+            axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown_signal())
+                .await
+                .unwrap();
+        }
+    }
 
     info!("Server shut down gracefully");
 }
 
 /// Waits for SIGTERM or SIGINT, then returns to trigger graceful shutdown.
 ///
-/// TODO: Add `tokio::signal::unix::SignalKind::terminate()` listener
-///       for production (Docker/K8s send SIGTERM, not SIGINT).
+/// Listens for both SIGTERM (production) and SIGINT (Ctrl+C in dev).
 async fn shutdown_signal() {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("Failed to install Ctrl+C handler");
+    let ctrl_c = tokio::signal::ctrl_c();
+    let mut term = std::pin::pin!(async {
+        #[cfg(unix)]
+        {
+            let mut stream = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("Failed to install SIGTERM handler");
+            stream.recv().await;
+        }
+        #[cfg(not(unix))]
+        {
+            // On non-unix, just wait forever
+            std::future::pending::<()>().await;
+        }
+    });
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = &mut term => {}
+    }
     info!("Shutdown signal received, draining connections...");
 }
 
@@ -805,6 +851,238 @@ async fn handle_update_profile(
     }; // write lock released
 
     Some(response)
+}
+
+/// ── CLI argument parsing ──────────────────────────────────────────────
+
+/// Parsed command-line arguments.
+struct CliArgs {
+    port: u16,
+    mode: ServerMode,
+}
+
+/// Server mode: plain WS or TLS-encrypted WSS.
+enum ServerMode {
+    Plain,
+    Tls {
+        cert_path: String,
+        key_path: String,
+    },
+}
+
+impl CliArgs {
+    fn parse() -> Self {
+        let raw: Vec<String> = std::env::args().collect();
+        let mut port: u16 = 9000;
+        let mut cert: Option<String> = None;
+        let mut key: Option<String> = None;
+
+        let mut i = 1;
+        while i < raw.len() {
+            match raw[i].as_str() {
+                "--help" | "-h" => {
+                    eprintln!("VurnChat Blind Relay Server");
+                    eprintln!();
+                    eprintln!("Usage:");
+                    eprintln!("  vurn-server [--port <PORT>] [--cert <CERT> --key <KEY>]");
+                    eprintln!();
+                    eprintln!("Options:");
+                    eprintln!("  --port <PORT>     Port to listen on (default: 9000)");
+                    eprintln!("  --cert <CERT>     Path to TLS certificate PEM file");
+                    eprintln!("  --key <KEY>       Path to TLS private key PEM file");
+                    eprintln!("  --help, -h        Show this help message");
+                    eprintln!();
+                    eprintln!("Examples:");
+                    eprintln!("  vurn-server");
+                    eprintln!("  vurn-server --port 8080");
+                    eprintln!("  vurn-server --cert cert.pem --key key.pem");
+                    eprintln!("  vurn-server --port 443 --cert /etc/letsencrypt/live/example.com/fullchain.pem --key /etc/letsencrypt/live/example.com/privkey.pem");
+                    std::process::exit(0);
+                }
+                "--port" => {
+                    i += 1;
+                    port = raw
+                        .get(i)
+                        .expect("--port requires a value")
+                        .parse()
+                        .expect("--port must be a valid port number");
+                }
+                "--cert" => {
+                    i += 1;
+                    cert = Some(
+                        raw.get(i)
+                            .expect("--cert requires a path")
+                            .clone(),
+                    );
+                }
+                "--key" => {
+                    i += 1;
+                    key = Some(
+                        raw.get(i)
+                            .expect("--key requires a path")
+                            .clone(),
+                    );
+                }
+                other => {
+                    eprintln!("Unknown argument: {}", other);
+                    eprintln!("Usage: vurn-server [--port <PORT>] [--cert <CERT> --key <KEY>]");
+                    std::process::exit(1);
+                }
+            }
+            i += 1;
+        }
+
+        let mode = match (cert, key) {
+            (Some(cert_path), Some(key_path)) => ServerMode::Tls {
+                cert_path,
+                key_path,
+            },
+            (None, None) => ServerMode::Plain,
+            (Some(_), None) | (None, Some(_)) => {
+                eprintln!("Error: --cert and --key must be used together");
+                std::process::exit(1);
+            }
+        };
+
+        CliArgs { port, mode }
+    }
+}
+
+/// ── TLS support ────────────────────────────────────────────────────
+
+/// Loads TLS configuration from PEM certificate and private key files.
+async fn load_tls_config(cert_path: &str, key_path: &str) -> Result<Arc<ServerConfig>, String> {
+    let certs = tokio::task::spawn_blocking({
+        let cp = cert_path.to_string();
+        move || -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, String> {
+            let mut reader = BufReader::new(
+                File::open(&cp).map_err(|e| format!("Failed to open cert file: {}", e))?,
+            );
+            rustls_pemfile::certs(&mut reader)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Failed to parse cert file: {}", e))
+        }
+    })
+    .await
+    .map_err(|e| format!("Task join failed: {}", e))??;
+
+    if certs.is_empty() {
+        return Err("No certificates found in cert file".to_string());
+    }
+
+    let key = tokio::task::spawn_blocking({
+        let kp = key_path.to_string();
+        move || -> Result<PrivateKeyDer<'static>, String> {
+            let mut reader = BufReader::new(
+                File::open(&kp).map_err(|e| format!("Failed to open key file: {}", e))?,
+            );
+            rustls_pemfile::private_key(&mut reader)
+                .map_err(|e| format!("Failed to parse key file: {}", e))?
+                .ok_or_else(|| "No private key found in key file".to_string())
+        }
+    })
+    .await
+    .map_err(|e| format!("Task join failed: {}", e))??;
+
+    let config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| format!("TLS config build failed: {}", e))?;
+
+    Ok(Arc::new(config))
+}
+
+/// Background task that reloads TLS certificates from disk every 24 hours.
+///
+/// Runs in an infinite loop. On each tick, re-reads the PEM files and
+/// replaces the shared TLS config. If loading fails, the old config
+/// remains in use and an error is logged — no connection disruption.
+async fn cert_reload_task(
+    tls_state: Arc<RwLock<Arc<ServerConfig>>>,
+    cert_path: &str,
+    key_path: &str,
+) {
+    let cp = cert_path.to_string();
+    let kp = key_path.to_string();
+
+    loop {
+        tokio::time::sleep(Duration::from_secs(24 * 3600)).await;
+
+        match load_tls_config(&cp, &kp).await {
+            Ok(new_config) => {
+                let mut guard = tls_state.write().await;
+                *guard = new_config;
+                info!("TLS certificates reloaded successfully — new certs are live");
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to reload TLS certificates (old certs still active): {}",
+                    e
+                );
+            }
+        }
+    }
+}
+
+/// Runs an async TLS accept loop with graceful shutdown.
+///
+/// Each incoming TCP connection is wrapped in a TLS layer via `tokio-rustls`,
+/// then served by the axum application. The shared `tls_state` allows
+/// hot-reloading of certificates without dropping existing connections.
+async fn run_tls_server(
+    addr: &str,
+    app: Router,
+    tls_state: Arc<RwLock<Arc<ServerConfig>>>,
+) {
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .expect("Failed to bind TCP listener");
+
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+
+    loop {
+        tokio::select! {
+            accept_result = listener.accept() => {
+                let (stream, _) = accept_result.expect("Failed to accept connection");
+                let app = app.clone();
+                let tls_state = tls_state.clone();
+
+                tokio::spawn(async move {
+                    let config = tls_state.read().await.clone();
+                    let acceptor = tokio_rustls::TlsAcceptor::from(config);
+
+                    match acceptor.accept(stream).await {
+                        Ok(tls_stream) => {
+                            let svc = hyper::service::service_fn(move |req| {
+                                let mut app = app.clone();
+                                async move {
+                                    let resp = app.call(req).await.unwrap();
+                                    Ok::<_, std::convert::Infallible>(resp)
+                                }
+                            });
+
+                            let io = TokioIo::new(tls_stream);
+
+                            if let Err(e) = hyper::server::conn::http1::Builder::new()
+                                .serve_connection(io, svc)
+                                .await
+                            {
+                                warn!("TLS connection error: {}", e);
+                            }
+                        }
+                        Err(e) => {
+                            warn!("TLS handshake failed: {}", e);
+                        }
+                    }
+                });
+            }
+            _ = &mut shutdown => {
+                info!("Shutdown signal received, stopping TLS accept loop...");
+                break;
+            }
+        }
+    }
 }
 
 /// Periodic background task that scavenges expired mailbox messages.
