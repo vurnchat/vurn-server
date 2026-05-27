@@ -7,20 +7,17 @@
 //! - `vmb_<hash>_<seq>` — stores individual message (seq = 1, 2, 3...)
 //! - `vmb_<hash>_index` — DHT hint for the current max seq
 //!
-//! ## MailboxStore (synchronous)
+//! ## MailboxStore (lazy-seeding)
 //!
 //! Uses an in-memory `HashMap<Vec<u8>, u64>` to track the current index.
-//! This avoids the two-phase DHT problem (get index → store).
+//! If the index is known (fast path), the store is synchronous and immediate.
+//! If the index is unknown (e.g. after restart), the node fetches it from DHT
+//! first via the `FetchingIndex` state machine, then resumes the store.
 //!
-//! 1. Read index from HashMap (or 0)
-//! 2. Increment, store message at seq key in DHT
-//! 3. Also write index to DHT as a hint for other nodes
+//! ## MailboxRetrieve (lazy-seeding)
 //!
-//! ## MailboxRetrieve (DHT state machine)
-//!
-//! 1. DHT get_record for `vmb_<hash>_index` → get index
-//! 2. For seq = 1..=index: DHT get_record for each seq key
-//! 3. Collect results, emit MailboxRetrieved when done
+//! If the in-memory index is available, goes directly to collecting seq messages.
+//! Otherwise fetches the index from DHT first.
 
 use std::{collections::HashMap, time::Duration};
 use futures::StreamExt;
@@ -83,9 +80,9 @@ pub enum NodeEvent {
 pub enum NodeCommand {
     DhtStore { key: Vec<u8>, value: Vec<u8> },
     DhtGet { key: Vec<u8> },
-    /// Store in sequential mailbox — uses in-memory index, synchronous.
+    /// Store in sequential mailbox — uses in-memory index (fast-path) or lazy DHT fetch.
     MailboxStore { recipient_hash: Vec<u8>, sender_hash: Vec<u8>, payload: Vec<u8> },
-    /// Retrieve all messages — uses DHT state machine.
+    /// Retrieve all messages — uses in-memory index (fast-path) or lazy DHT fetch.
     MailboxRetrieve { user_hash: Vec<u8> },
     Dial { addr: Multiaddr },
     Subscribe { topic: String },
@@ -93,14 +90,33 @@ pub enum NodeCommand {
     Bootstrap,
 }
 
+// ── Pending command (for lazy-seeding FetchingIndex) ────────────────
+
+/// A MailboxStore or MailboxRetrieve command that was deferred because
+/// the in-memory index was not available and needed to be fetched from DHT.
+#[derive(Debug, Clone)]
+enum PendingNodeCommand {
+    MailboxStore { recipient_hash: Vec<u8>, sender_hash: Vec<u8>, payload: Vec<u8> },
+    MailboxRetrieve { user_hash: Vec<u8> },
+}
+
+impl PendingNodeCommand {
+    fn user_hash(&self) -> &[u8] {
+        match self {
+            PendingNodeCommand::MailboxStore { recipient_hash, .. } => recipient_hash,
+            PendingNodeCommand::MailboxRetrieve { user_hash } => user_hash,
+        }
+    }
+}
+
 // ── Internal state machine ──────────────────────────────────────────
 
 enum MailboxState {
     Idle,
-    /// Waiting for index DHT response to begin retrieval.
-    Retrieving { user_hash: Vec<u8> },
+    /// Waiting for index DHT response (lazy seeding).
+    FetchingIndex { pending_command: PendingNodeCommand },
     /// Collecting individual seq messages after index was obtained.
-    Collecting {
+    CollectingMessages {
         user_hash: Vec<u8>,
         messages: Vec<Vec<u8>>,
         remaining: Vec<u64>,
@@ -193,7 +209,7 @@ impl P2PNode {
             loop {
                 tokio::select! {
                     event = swarm.select_next_some() => {
-                        mailbox_state = handle_swarm_event(event, &ev_tx, &mut swarm, mailbox_state).await;
+                        mailbox_state = handle_swarm_event(event, &ev_tx, &mut swarm, mailbox_state, &mut mailbox_indices).await;
                     }
                     cmd = cmd_rx.recv() => {
                         let Some(cmd) = cmd else { break; };
@@ -215,16 +231,18 @@ impl P2PNode {
 
 // ── Event handling ─────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_swarm_event(
     event: SwarmEvent<NodeBehaviourEvent>,
     ev_tx: &mpsc::Sender<NodeEvent>,
     swarm: &mut libp2p::Swarm<NodeBehaviour>,
     mailbox_state: MailboxState,
+    mailbox_indices: &mut HashMap<Vec<u8>, u64>,
 ) -> MailboxState {
     match event {
         SwarmEvent::Behaviour(be) => match be {
             NodeBehaviourEvent::Kademlia(kad_event) => {
-                handle_kad_event(kad_event, ev_tx, swarm, mailbox_state).await
+                handle_kad_event(kad_event, ev_tx, swarm, mailbox_state, mailbox_indices).await
             }
             NodeBehaviourEvent::Gossipsub(gs_event) => {
                 handle_gossipsub_event(gs_event, ev_tx);
@@ -267,11 +285,13 @@ async fn handle_swarm_event(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_kad_event(
     event: kad::Event,
     ev_tx: &mpsc::Sender<NodeEvent>,
     swarm: &mut libp2p::Swarm<NodeBehaviour>,
     mut state: MailboxState,
+    mailbox_indices: &mut HashMap<Vec<u8>, u64>,
 ) -> MailboxState {
     match event {
         kad::Event::OutboundQueryProgressed { result, .. } => {
@@ -281,25 +301,22 @@ async fn handle_kad_event(
                     kad::GetRecordOk::FoundRecord(peer_record) => {
                         let key = peer_record.record.key.to_vec();
                         let value = Some(peer_record.record.value.clone());
-                        handle_get_record_response(key, value, ev_tx, swarm, &mut state).await
+                        handle_get_record_response(key, value, ev_tx, swarm, &mut state, mailbox_indices).await
                     }
                     kad::GetRecordOk::FinishedWithNoAdditionalRecord { .. } => {
                         // Key not found in DHT.
-                        // For Retrieving: treat as index = 0 → emit empty.
-                        // For Collecting: treat seq as not found → skip.
                         match &state {
-                            MailboxState::Retrieving { user_hash } => {
-                                info!("MailboxRetrieve: no index found in DHT for {}",
-                                    hex_fmt(user_hash, 8));
-                                let _ = ev_tx.send(NodeEvent::MailboxRetrieved {
-                                    user_hash: user_hash.clone(),
-                                    messages: vec![],
-                                }).await;
-                                state = MailboxState::Idle;
+                            MailboxState::FetchingIndex { pending_command } => {
+                                // No index in DHT — this is a fresh mailbox (index = 0)
+                                let user_hash = pending_command.user_hash().to_vec();
+                                info!("Lazy seeding: no index found in DHT for {} → seeding 0",
+                                    hex_fmt(&user_hash, 8));
+                                mailbox_indices.insert(user_hash.clone(), 0);
+                                // Resume the pending command with index = 0
+                                state = resume_pending_command(pending_command, 0, ev_tx, swarm, mailbox_indices).await;
                             }
-                            MailboxState::Collecting { user_hash, messages, remaining } => {
-                                // The "not found" is for a seq that doesn't exist.
-                                // Skip it and continue with the next.
+                            MailboxState::CollectingMessages { user_hash, messages, remaining } => {
+                                // A seq that doesn't exist — skip it and continue
                                 let mut remaining = remaining.clone();
                                 let mut messages = messages.clone();
                                 if !remaining.is_empty() {
@@ -315,7 +332,7 @@ async fn handle_kad_event(
                                     let next_seq = remaining[0];
                                     let seq_key = dht::mailbox_seq_key(user_hash, next_seq);
                                     swarm.behaviour_mut().kademlia.get_record(seq_key);
-                                    state = MailboxState::Collecting {
+                                    state = MailboxState::CollectingMessages {
                                         user_hash: user_hash.clone(),
                                         messages: messages.clone(),
                                         remaining,
@@ -364,46 +381,98 @@ async fn handle_kad_event(
     }
 }
 
+/// Resume a pending command with a known index from DHT.
+///
+/// For `MailboxStore`: execute the store with the fetched index, update in-memory index.
+/// For `MailboxRetrieve`: either emit empty (index=0) or start collecting seq messages.
+async fn resume_pending_command(
+    pending: &PendingNodeCommand,
+    index: u64,
+    ev_tx: &mpsc::Sender<NodeEvent>,
+    swarm: &mut libp2p::Swarm<NodeBehaviour>,
+    mailbox_indices: &mut HashMap<Vec<u8>, u64>,
+) -> MailboxState {
+    match pending {
+        PendingNodeCommand::MailboxStore { recipient_hash, sender_hash, payload } => {
+            let new_index = index + 1;
+            let seq_key = dht::mailbox_seq_key(recipient_hash, new_index);
+            let msg = dht::encode_mailbox_message(sender_hash, payload);
+            let _ = swarm.behaviour_mut().kademlia.put_record(
+                kad::Record {
+                    key: seq_key,
+                    value: msg,
+                    publisher: None,
+                    expires: None,
+                },
+                kad::Quorum::One,
+            );
+            // Update in-memory index so future stores use fast path
+            mailbox_indices.insert(recipient_hash.clone(), new_index);
+            // Write index hint to DHT (best-effort)
+            let index_key = dht::mailbox_index_key(recipient_hash);
+            let idx_bytes = dht::encode_index(new_index);
+            let _ = swarm.behaviour_mut().kademlia.put_record(
+                kad::Record {
+                    key: index_key,
+                    value: idx_bytes,
+                    publisher: None,
+                    expires: None,
+                },
+                kad::Quorum::One,
+            );
+            info!("MailboxStore (lazy): seq {new_index} (seeded index={index}) for {}",
+                hex_fmt(recipient_hash, 8));
+            MailboxState::Idle
+        }
+        PendingNodeCommand::MailboxRetrieve { user_hash } => {
+            if index == 0 {
+                info!("MailboxRetrieve (lazy): index=0 for {}",
+                    hex_fmt(user_hash, 8));
+                let _ = ev_tx.send(NodeEvent::MailboxRetrieved {
+                    user_hash: user_hash.clone(),
+                    messages: vec![],
+                }).await;
+                MailboxState::Idle
+            } else {
+                info!("MailboxRetrieve (lazy): index={index}, fetching {} msgs for {}",
+                    index, hex_fmt(user_hash, 8));
+                let remaining: Vec<u64> = (1..=index).collect();
+                let first_seq = remaining[0];
+                let seq_key = dht::mailbox_seq_key(user_hash, first_seq);
+                swarm.behaviour_mut().kademlia.get_record(seq_key);
+                MailboxState::CollectingMessages {
+                    user_hash: user_hash.clone(),
+                    messages: vec![],
+                    remaining,
+                }
+            }
+        }
+    }
+}
+
 /// Process a GetRecord response in the context of the mailbox state machine.
+#[allow(clippy::too_many_arguments)]
 async fn handle_get_record_response(
     key: Vec<u8>,
     value: Option<Vec<u8>>,
     ev_tx: &mpsc::Sender<NodeEvent>,
     swarm: &mut libp2p::Swarm<NodeBehaviour>,
     state: &mut MailboxState,
+    mailbox_indices: &mut HashMap<Vec<u8>, u64>,
 ) -> MailboxState {
     match state {
-        // ── Retrieving: got index, start collecting seq messages ──
-        MailboxState::Retrieving { user_hash } => {
-            let current_index = value.as_deref().map(dht::decode_index).unwrap_or(0);
-            if current_index == 0 {
-                info!("MailboxRetrieve: index=0 for {}", hex_fmt(user_hash, 8));
-                let _ = ev_tx.send(NodeEvent::MailboxRetrieved {
-                    user_hash: user_hash.clone(),
-                    messages: vec![],
-                }).await;
-                return MailboxState::Idle;
-            }
-
-            info!(
-                "MailboxRetrieve: index={}, fetching {} msgs for {}",
-                current_index, current_index, hex_fmt(user_hash, 8)
-            );
-
-            let remaining: Vec<u64> = (1..=current_index).collect();
-            let first_seq = remaining[0];
-            let seq_key = dht::mailbox_seq_key(user_hash, first_seq);
-            swarm.behaviour_mut().kademlia.get_record(seq_key);
-
-            MailboxState::Collecting {
-                user_hash: user_hash.clone(),
-                messages: vec![],
-                remaining,
-            }
+        // ── FetchingIndex: got the index from DHT, seed and resume ──
+        MailboxState::FetchingIndex { ref pending_command } => {
+            let index = value.as_deref().map(dht::decode_index).unwrap_or(0);
+            let user_hash = pending_command.user_hash().to_vec();
+            info!("Lazy seeding: got index={index} from DHT for {}",
+                hex_fmt(&user_hash, 8));
+            mailbox_indices.insert(user_hash, index);
+            resume_pending_command(pending_command, index, ev_tx, swarm, mailbox_indices).await
         }
 
-        // ── Collecting: got a seq message, add to collection ──
-        MailboxState::Collecting { user_hash, messages, remaining } => {
+        // ── CollectingMessages: got a seq message, add to collection ──
+        MailboxState::CollectingMessages { user_hash, messages, remaining } => {
             if remaining.is_empty() {
                 let msgs = messages.clone();
                 let _ = ev_tx.send(NodeEvent::MailboxRetrieved {
@@ -433,7 +502,7 @@ async fn handle_get_record_response(
                 let next_seq = remaining[0];
                 let seq_key = dht::mailbox_seq_key(user_hash, next_seq);
                 swarm.behaviour_mut().kademlia.get_record(seq_key);
-                MailboxState::Collecting {
+                MailboxState::CollectingMessages {
                     user_hash: user_hash.clone(),
                     messages: messages.clone(),
                     remaining: remaining.clone(),
@@ -497,7 +566,7 @@ fn handle_gossipsub_event(
 async fn handle_command(
     swarm: &mut libp2p::Swarm<NodeBehaviour>,
     cmd: NodeCommand,
-    _ev_tx: &mpsc::Sender<NodeEvent>,
+    ev_tx: &mpsc::Sender<NodeEvent>,
     mailbox_state: MailboxState,
     mailbox_indices: &mut HashMap<Vec<u8>, u64>,
 ) -> MailboxState {
@@ -531,65 +600,98 @@ async fn handle_command(
             mailbox_state
         }
 
-        // ── MailboxStore: synchronous via in-memory index ──
+        // ── MailboxStore: fast path (in-memory) or lazy DHT fetch ──
         NodeCommand::MailboxStore { recipient_hash, sender_hash, payload } => {
-            use kad::Record;
+            if !mailbox_state.is_idle() {
+                warn!("MailboxStore: previous operation still in progress, dropping");
+                return mailbox_state;
+            }
 
-            let current_index = mailbox_indices.get(&recipient_hash).copied().unwrap_or(0);
-            let new_index = current_index + 1;
+            // Fast path: index is in memory
+            if let Some(&current_index) = mailbox_indices.get(&recipient_hash) {
+                let new_index = current_index + 1;
+                let seq_key = dht::mailbox_seq_key(&recipient_hash, new_index);
+                let msg = dht::encode_mailbox_message(&sender_hash, &payload);
+                let _ = kademlia.put_record(
+                    kad::Record {
+                        key: seq_key,
+                        value: msg,
+                        publisher: None,
+                        expires: None,
+                    },
+                    kad::Quorum::One,
+                );
+                mailbox_indices.insert(recipient_hash.clone(), new_index);
+                // Write index hint to DHT (best-effort)
+                let index_key = dht::mailbox_index_key(&recipient_hash);
+                let idx_bytes = dht::encode_index(new_index);
+                let _ = kademlia.put_record(
+                    kad::Record {
+                        key: index_key,
+                        value: idx_bytes,
+                        publisher: None,
+                        expires: None,
+                    },
+                    kad::Quorum::One,
+                );
+                info!("MailboxStore (fast): seq {new_index} for {}",
+                    hex_fmt(&recipient_hash, 8));
+                return mailbox_state;
+            }
 
-            // 1. Store message at vmb_<hash>_<seq>
-            let seq_key = dht::mailbox_seq_key(&recipient_hash, new_index);
-            let msg = dht::encode_mailbox_message(&sender_hash, &payload);
-            let _ = kademlia.put_record(
-                Record {
-                    key: seq_key,
-                    value: msg,
-                    publisher: None,
-                    expires: None,
-                },
-                kad::Quorum::One,
-            );
-
-            // 2. Update in-memory index
-            mailbox_indices.insert(recipient_hash.clone(), new_index);
-
-            // 3. Write index hint to DHT (best-effort, for cross-node retrieval)
+            // Lazy seeding: index not in memory, fetch from DHT
+            info!("MailboxStore (lazy): fetching index from DHT for {}",
+                hex_fmt(&recipient_hash, 8));
             let index_key = dht::mailbox_index_key(&recipient_hash);
-            let idx_bytes = dht::encode_index(new_index);
-            let _ = kademlia.put_record(
-                Record {
-                    key: index_key,
-                    value: idx_bytes,
-                    publisher: None,
-                    expires: None,
+            kademlia.get_record(index_key);
+            MailboxState::FetchingIndex {
+                pending_command: PendingNodeCommand::MailboxStore {
+                    recipient_hash,
+                    sender_hash,
+                    payload,
                 },
-                kad::Quorum::One,
-            );
-
-            info!(
-                "MailboxStore: seq {new_index} (in-mem) for {}",
-                hex_fmt(&recipient_hash, 8)
-            );
-
-            mailbox_state
+            }
         }
 
-        // ── MailboxRetrieve: DHT state machine ──
+        // ── MailboxRetrieve: fast path (in-memory) or lazy DHT fetch ──
         NodeCommand::MailboxRetrieve { user_hash } => {
             if !mailbox_state.is_idle() {
                 warn!("MailboxRetrieve: previous operation still in progress, dropping");
                 return mailbox_state;
             }
 
-            info!(
-                "MailboxRetrieve: querying DHT index for {}",
-                hex_fmt(&user_hash, 8)
-            );
+            // Fast path: index is in memory
+            if let Some(&index) = mailbox_indices.get(&user_hash) {
+                if index == 0 {
+                    info!("MailboxRetrieve (fast): index=0 for {}",
+                        hex_fmt(&user_hash, 8));
+                    let _ = ev_tx.send(NodeEvent::MailboxRetrieved {
+                        user_hash: user_hash.clone(),
+                        messages: vec![],
+                    }).await;
+                    return mailbox_state;
+                }
+                info!("MailboxRetrieve (fast): index={index}, fetching {index} msgs for {}",
+                    hex_fmt(&user_hash, 8));
+                let remaining: Vec<u64> = (1..=index).collect();
+                let first_seq = remaining[0];
+                let seq_key = dht::mailbox_seq_key(&user_hash, first_seq);
+                kademlia.get_record(seq_key);
+                return MailboxState::CollectingMessages {
+                    user_hash,
+                    messages: vec![],
+                    remaining,
+                };
+            }
+
+            // Lazy seeding: index not in memory, fetch from DHT
+            info!("MailboxRetrieve (lazy): fetching index from DHT for {}",
+                hex_fmt(&user_hash, 8));
             let index_key = dht::mailbox_index_key(&user_hash);
             kademlia.get_record(index_key);
-
-            MailboxState::Retrieving { user_hash }
+            MailboxState::FetchingIndex {
+                pending_command: PendingNodeCommand::MailboxRetrieve { user_hash },
+            }
         }
 
         // ── GossipSub ──
