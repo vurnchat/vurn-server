@@ -19,6 +19,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+use tokio::sync::oneshot;
 use ed25519_dalek::SigningKey;
 use futures::StreamExt;
 use kad::store::MemoryStore;
@@ -80,7 +81,7 @@ pub enum NodeEvent {
     Error(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum NodeCommand {
     DhtStore { key: Vec<u8>, value: Vec<u8> },
     DhtGet { key: Vec<u8> },
@@ -92,6 +93,13 @@ pub enum NodeCommand {
     Subscribe { topic: String },
     Publish { topic: String, data: Vec<u8> },
     Bootstrap,
+    /// Store a blind user profile in DHT (vup_<search_index>).
+    ProfileStore { index: Vec<u8>, blob: Vec<u8> },
+    /// Look up a blind user profile in DHT. Response is sent via oneshot.
+    ProfileLookup {
+        index: Vec<u8>,
+        resp: oneshot::Sender<Option<Vec<u8>>>,
+    },
 }
 
 // ── Pending command (for speculative FetchingIndex) ─────────────────
@@ -278,6 +286,9 @@ impl P2PNode {
             // Reconnect check: every 10 seconds, try re-dialing known peers
             let mut reconnect_tick = tokio::time::interval(Duration::from_secs(10));
 
+            // Pending profile DHT lookups: query_id → oneshot sender
+            let mut pending_profile_queries: HashMap<kad::QueryId, oneshot::Sender<Option<Vec<u8>>>> = HashMap::new();
+
             loop {
                 tokio::select! {
                     _ = timeout_tick.tick() => {
@@ -318,6 +329,7 @@ impl P2PNode {
                             event, &ev_tx, &mut swarm, mailbox_state,
                             &mut mailbox_indices, &signing_key,
                             &mut known_peers, &mut peer_addrs, &sled_db,
+                            &mut pending_profile_queries,
                         ).await;
                         mailbox_state = check_state_timeout(mailbox_state, &ev_tx);
                     }
@@ -346,6 +358,7 @@ impl P2PNode {
                         mailbox_state = handle_command(
                             &mut swarm, cmd, &ev_tx, mailbox_state,
                             &mut mailbox_indices, &signing_key,
+                            &mut pending_profile_queries,
                         ).await;
                         mailbox_state = check_state_timeout(mailbox_state, &ev_tx);
                     }
@@ -372,6 +385,7 @@ fn generate_signing_key() -> SigningKey {
 // ── Event handling ─────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn handle_swarm_event(
     event: SwarmEvent<NodeBehaviourEvent>,
     ev_tx: &mpsc::Sender<NodeEvent>,
@@ -382,11 +396,12 @@ async fn handle_swarm_event(
     known_peers: &mut HashMap<PeerId, (u32, std::time::Instant)>,
     peer_addrs: &mut HashMap<PeerId, Vec<Multiaddr>>,
     sled_db: &sled::Db,
+    pending_profile_queries: &mut HashMap<kad::QueryId, oneshot::Sender<Option<Vec<u8>>>>,
 ) -> MailboxState {
     match event {
         SwarmEvent::Behaviour(be) => match be {
             NodeBehaviourEvent::Kademlia(kad_event) => {
-                handle_kad_event(kad_event, ev_tx, swarm, mailbox_state, mailbox_indices, signing_key).await
+                handle_kad_event(kad_event, ev_tx, swarm, mailbox_state, mailbox_indices, signing_key, pending_profile_queries).await
             }
             NodeBehaviourEvent::Gossipsub(gs_event) => {
                 handle_gossipsub_event(gs_event, ev_tx);
@@ -439,6 +454,7 @@ async fn handle_swarm_event(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn handle_kad_event(
     event: kad::Event,
     ev_tx: &mpsc::Sender<NodeEvent>,
@@ -446,6 +462,7 @@ async fn handle_kad_event(
     mut state: MailboxState,
     mailbox_indices: &mut HashMap<Vec<u8>, u64>,
     signing_key: &SigningKey,
+    pending_profile_queries: &mut HashMap<kad::QueryId, oneshot::Sender<Option<Vec<u8>>>>,
 ) -> MailboxState {
     match event {
         kad::Event::OutboundQueryProgressed { id, result, .. } => {
@@ -454,16 +471,34 @@ async fn handle_kad_event(
                 QueryResult::GetRecord(Ok(ok)) => match ok {
                     kad::GetRecordOk::FoundRecord(peer_record) => {
                         let key = peer_record.record.key.to_vec();
-                        let value = peer_record.record.value.clone();
-                        state = handle_found_record(key, Some(value), id, ev_tx, swarm, state, mailbox_indices, signing_key).await;
+                        let value = Some(peer_record.record.value.clone());
+
+                        // Check for pending profile lookup first (vup_ prefix)
+                        if dht::parse_profile_key(&key).is_some() {
+                            if let Some(resp) = pending_profile_queries.remove(&id) {
+                                let _ = resp.send(value);
+                            }
+                            return state;
+                        }
+
+                        state = handle_found_record(key, value, id, ev_tx, swarm, state, mailbox_indices, signing_key).await;
                     }
                     kad::GetRecordOk::FinishedWithNoAdditionalRecord { .. } => {
+                        // Check for pending profile lookup (query not matched by key prefix)
+                        if let Some(resp) = pending_profile_queries.remove(&id) {
+                            let _ = resp.send(None);
+                            return state;
+                        }
                         // A seq key not found — match by query id
                         state = handle_not_found(id, ev_tx, swarm, state, mailbox_indices, signing_key).await;
                     }
                 },
                 QueryResult::GetRecord(Err(e)) => {
                     warn!("DHT get_record failed: {e:?}");
+                    // Check for pending profile lookup
+                    if let Some(resp) = pending_profile_queries.remove(&id) {
+                        let _ = resp.send(None);
+                    }
                     if !state.is_idle() {
                         state = MailboxState::Idle;
                     }
@@ -832,6 +867,7 @@ fn handle_gossipsub_event(
 // ── Command handling ────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn handle_command(
     swarm: &mut libp2p::Swarm<NodeBehaviour>,
     cmd: NodeCommand,
@@ -839,6 +875,7 @@ async fn handle_command(
     mailbox_state: MailboxState,
     mailbox_indices: &mut HashMap<Vec<u8>, u64>,
     signing_key: &SigningKey,
+    pending_profile_queries: &mut HashMap<kad::QueryId, oneshot::Sender<Option<Vec<u8>>>>,
 ) -> MailboxState {
     let NodeBehaviour {
         ref mut kademlia,
@@ -904,6 +941,28 @@ async fn handle_command(
                 found: vec![],
                 deadline,
             }
+        }
+
+        // ── Blind Profile (DHT) ──
+        NodeCommand::ProfileStore { index, blob } => {
+            let key = dht::profile_key(&index);
+            use kad::Record;
+            let record = Record {
+                key,
+                value: blob,
+                publisher: None,
+                expires: None,
+            };
+            kademlia.put_record(record, kad::Quorum::Majority);
+            info!("ProfileStore: stored profile for index {}", hex_fmt(&index, 8));
+            mailbox_state
+        }
+        NodeCommand::ProfileLookup { index, resp } => {
+            let key = dht::profile_key(&index);
+            let qid = kademlia.get_record(key);
+            pending_profile_queries.insert(qid, resp);
+            info!("ProfileLookup: querying DHT for index {}", hex_fmt(&index, 8));
+            mailbox_state
         }
 
         // ── MailboxRetrieve: fast path (in-memory) or speculative probing ──

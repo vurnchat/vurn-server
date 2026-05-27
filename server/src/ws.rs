@@ -20,18 +20,12 @@ use tokio::sync::{mpsc, RwLock};
 use tracing::{error, info, warn};
 
 use crate::p2p::NodeCommand;
+use tokio::sync::oneshot;
 
 // ── Protocol constants ──────────────────────────────────────────────
 
 const PROFILE_SUCCESS: [u8; 3] = [0xFE, 0x00, 0x00];
 const PROFILE_OCCUPIED: [u8; 3] = [0xFF, 0x00, 0x01];
-
-// ── Profile entry ───────────────────────────────────────────────────
-
-pub struct ProfileEntry {
-    owner_hash: Vec<u8>,
-    blob: Vec<u8>,
-}
 
 // ── Shared state ────────────────────────────────────────────────────
 
@@ -39,11 +33,7 @@ pub struct ProfileEntry {
 pub struct GatewayStateInner {
     /// WS senders: user_hash → list of send channels
     pub clients: HashMap<Vec<u8>, Vec<mpsc::UnboundedSender<Vec<u8>>>>,
-    /// Blind profiles: search index → encrypted blob
-    pub blind_profiles: HashMap<Vec<u8>, ProfileEntry>,
-    /// Owner hash → search index (one username per user)
-    pub user_profiles: HashMap<Vec<u8>, Vec<u8>>,
-    /// P2P node command channel (for DHT mailbox storage)
+    /// P2P node command channel (for DHT mailbox storage and profiles)
     pub p2p_cmd_tx: Option<mpsc::Sender<NodeCommand>>,
 }
 
@@ -53,8 +43,6 @@ impl Default for GatewayStateInner {
     fn default() -> Self {
         Self {
             clients: HashMap::new(),
-            blind_profiles: HashMap::new(),
-            user_profiles: HashMap::new(),
             p2p_cmd_tx: None,
         }
     }
@@ -248,7 +236,7 @@ async fn relay_or_p2p(state: &SharedState, sender_id: &[u8], data: &[u8]) {
     }
 }
 
-// ── Profile operations (unchanged) ──────────────────────────────────
+// ── Profile operations (DHT-backed) ──────────────────────────────────
 
 async fn handle_profile_operation(
     state: &SharedState,
@@ -259,8 +247,8 @@ async fn handle_profile_operation(
     let response = match opcode {
         0x01 => handle_register_profile(state, client_id, payload).await,
         0x02 => handle_lookup_profile(state, payload).await,
-        0x03 => handle_unregister_profile(state, client_id, payload).await,
-        0x04 => handle_update_profile(state, client_id, payload).await,
+        0x03 => handle_unregister_profile(state, payload).await,
+        0x04 => handle_update_profile(state, payload).await,
         _ => {
             warn!("Unknown profile operation: 0x{opcode:02x}");
             return;
@@ -277,74 +265,107 @@ async fn handle_profile_operation(
     }
 }
 
+/// Register a blind username in the DHT.
+/// 1. First queries DHT to check if the search_index is already taken
+/// 2. If free, stores the encrypted blob in DHT via ProfileStore
 async fn handle_register_profile(
     state: &SharedState,
-    owner_id: &[u8],
+    _owner_id: &[u8],
     payload: &[u8],
 ) -> Option<Vec<u8>> {
     if payload.len() < 32 {
         return None;
     }
-    let new_index = payload[..32].to_vec();
+    let index = payload[..32].to_vec();
     let blob = payload[32..].to_vec();
-    let mut map = state.write().await;
-    if let Some(existing) = map.blind_profiles.get(&new_index) {
-        if existing.owner_hash != owner_id {
-            return Some(PROFILE_OCCUPIED.to_vec());
-        }
+
+    let cmd_tx = {
+        let map = state.read().await;
+        map.p2p_cmd_tx.clone()
+    };
+    let cmd_tx = cmd_tx?;
+
+    // Step 1: Check if profile already exists in DHT
+    let (tx, rx) = oneshot::channel();
+    if cmd_tx.send(NodeCommand::ProfileLookup {
+        index: index.clone(),
+        resp: tx,
+    }).await.is_err() {
+        return None;
     }
-    let old_index = map.user_profiles.get(owner_id).cloned();
-    if let Some(ref old) = old_index {
-        if *old != new_index {
-            map.blind_profiles.remove(old);
-        }
+
+    let existing = match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
+        Ok(Ok(blob)) => blob,
+        _ => None,
+    };
+
+    if existing.is_some() {
+        info!("Profile occupied: index {}", hex_fmt(&index, 8));
+        return Some(PROFILE_OCCUPIED.to_vec());
     }
-    map.blind_profiles.insert(new_index, ProfileEntry {
-        owner_hash: owner_id.to_vec(),
-        blob,
-    });
-    map.user_profiles.insert(owner_id.to_vec(), old_index.unwrap_or_default());
+
+    // Step 2: Store in DHT
+    if cmd_tx.send(NodeCommand::ProfileStore { index, blob }).await.is_err() {
+        return None;
+    }
+
     Some(PROFILE_SUCCESS.to_vec())
 }
 
+/// Look up a blind username in the DHT.
+/// Queries DHT via ProfileLookup, returns the encrypted blob or "not found".
 async fn handle_lookup_profile(state: &SharedState, payload: &[u8]) -> Option<Vec<u8>> {
     if payload.len() < 32 {
         return None;
     }
     let index = payload[..32].to_vec();
-    let map = state.read().await;
-    if let Some(entry) = map.blind_profiles.get(&index) {
-        let mut resp = vec![0xFE, 0x01];
-        resp.extend_from_slice(&(entry.blob.len() as u16).to_le_bytes());
-        resp.extend_from_slice(&entry.blob);
-        Some(resp)
-    } else {
-        Some(vec![0xFF, 0x01, 0x00])
-    }
-}
 
-async fn handle_unregister_profile(
-    state: &SharedState,
-    caller_id: &[u8],
-    payload: &[u8],
-) -> Option<Vec<u8>> {
-    if payload.len() < 32 {
+    let cmd_tx = {
+        let map = state.read().await;
+        map.p2p_cmd_tx.clone()
+    };
+    let cmd_tx = cmd_tx?;
+
+    let (tx, rx) = oneshot::channel();
+    if cmd_tx.send(NodeCommand::ProfileLookup {
+        index,
+        resp: tx,
+    }).await.is_err() {
         return None;
     }
-    let index = payload[..32].to_vec();
-    let mut map = state.write().await;
-    match map.blind_profiles.get(&index) {
-        Some(entry) if entry.owner_hash == caller_id => {
-            map.blind_profiles.remove(&index);
-            Some(vec![0xFE, 0x02, 0x00])
+
+    let blob = match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
+        Ok(Ok(b)) => b,
+        _ => None,
+    };
+
+    match blob {
+        Some(data) => {
+            let mut resp = vec![0xFE, 0x01];
+            let len16 = data.len() as u16;
+            resp.extend_from_slice(&len16.to_le_bytes());
+            resp.extend_from_slice(&data);
+            Some(resp)
         }
-        _ => Some(vec![0xFF, 0x02, 0x00]),
+        None => Some(vec![0xFF, 0x01, 0x00]),
     }
 }
 
+/// Unregister is not supported for DHT-backed profiles.
+/// Returns "operation failed" to the client.
+async fn handle_unregister_profile(
+    _state: &SharedState,
+    _payload: &[u8],
+) -> Option<Vec<u8>> {
+    info!("UnregisterProfile not supported in DHT mode");
+    Some(vec![0xFF, 0x02, 0x00])
+}
+
+/// Update profile by overwriting the DHT entry.
+/// Anyone who knows the search_index can overwrite, which is acceptable
+/// since the blob is AES-GCM encrypted with a key derived from the username.
 async fn handle_update_profile(
     state: &SharedState,
-    caller_id: &[u8],
     payload: &[u8],
 ) -> Option<Vec<u8>> {
     if payload.len() < 32 {
@@ -355,14 +376,18 @@ async fn handle_update_profile(
     if new_blob.is_empty() {
         return None;
     }
-    let mut map = state.write().await;
-    match map.blind_profiles.get_mut(&index) {
-        Some(entry) if entry.owner_hash == caller_id => {
-            entry.blob = new_blob;
-            Some(vec![0xFE, 0x03, 0x00])
-        }
-        _ => Some(vec![0xFF, 0x03, 0x00]),
+
+    let cmd_tx = {
+        let map = state.read().await;
+        map.p2p_cmd_tx.clone()
+    };
+    let cmd_tx = cmd_tx?;
+
+    if cmd_tx.send(NodeCommand::ProfileStore { index, blob: new_blob }).await.is_err() {
+        return None;
     }
+
+    Some(vec![0xFE, 0x03, 0x00])
 }
 
 // ── Helper ──────────────────────────────────────────────────────────

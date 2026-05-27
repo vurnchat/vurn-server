@@ -27,6 +27,7 @@ use libp2p::kad::RecordKey;
 use serde::{Deserialize, Serialize};
 
 const MAILBOX_KEY_PREFIX: &[u8] = b"vmb_";
+const PROFILE_KEY_PREFIX: &[u8] = b"vup_";
 
 /// Cryptographically signed envelope stored in the DHT.
 ///
@@ -97,6 +98,48 @@ pub fn serialize_envelope(envelope: &DhtEnvelope) -> Result<Vec<u8>, String> {
 pub fn deserialize_envelope(data: &[u8]) -> Result<DhtEnvelope, String> {
     bincode::deserialize(data)
         .map_err(|e| format!("Failed to deserialize DhtEnvelope: {e}"))
+}
+
+// ── Profile key helpers ────────────────────────────────────────────
+
+/// DHT key for a blind user profile.
+/// Format: `vup_<search_index>` where search_index is HMAC-SHA256(lowercase(username)).
+pub fn profile_key(search_index: &[u8]) -> RecordKey {
+    let mut key = Vec::with_capacity(4 + search_index.len());
+    key.extend_from_slice(PROFILE_KEY_PREFIX);
+    key.extend_from_slice(search_index);
+    RecordKey::new(&key)
+}
+
+/// Extract the search index from a profile key.
+/// Format: `vup_<search_index>` — returns the `<search_index>` portion.
+pub fn parse_profile_key(key: &[u8]) -> Option<Vec<u8>> {
+    if !key.starts_with(PROFILE_KEY_PREFIX) {
+        return None;
+    }
+    Some(key[4..].to_vec())
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+
+    #[test]
+    fn test_profile_key_roundtrip() {
+        let index = b"abcdef0123456789abcdef0123456789"; // 32-byte hash
+        let key = profile_key(index);
+        let key_bytes = key.to_vec();
+        assert!(key_bytes.starts_with(b"vup_"));
+        assert_eq!(&key_bytes[4..], index);
+        let parsed = parse_profile_key(&key_bytes);
+        assert_eq!(parsed, Some(index.to_vec()));
+    }
+
+    #[test]
+    fn test_parse_profile_key_invalid() {
+        assert!(parse_profile_key(b"vmb_xyz").is_none(), "mailbox key must not match");
+        assert!(parse_profile_key(b"no_prefix").is_none());
+    }
 }
 
 // ── Ed25519 verification (no new dependency — uses ed25519-dalek) ──
