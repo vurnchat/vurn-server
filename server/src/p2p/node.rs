@@ -122,10 +122,13 @@ enum MailboxState {
         deadline: std::time::Instant,
     },
     /// Collecting individual seq messages after index was determined.
+    /// Falls back to Idle after 30 seconds, emitting partial results.
     CollectingMessages {
         user_hash: Vec<u8>,
         messages: Vec<Vec<u8>>,
         remaining: Vec<u64>,
+        /// Deadline: if exceeded, emit partial results and transition to Idle
+        deadline: std::time::Instant,
     },
 }
 
@@ -214,21 +217,21 @@ impl P2PNode {
             let mut mailbox_state = MailboxState::Idle;
             let mut mailbox_indices: HashMap<Vec<u8>, u64> = HashMap::new();
 
-            // Timeout polling: every 5 seconds, check if FetchingIndex has expired.
-            // This is only awaited when both swarm events and commands are idle.
+            // Timeout polling: every 5 seconds, check if FetchingIndex or
+            // CollectingMessages has expired.
             let mut timeout_tick = tokio::time::interval(Duration::from_secs(5));
 
             loop {
                 tokio::select! {
                     _ = timeout_tick.tick() => {
-                        mailbox_state = check_fetching_timeout(mailbox_state);
+                        mailbox_state = check_state_timeout(mailbox_state, &ev_tx);
                     }
                     event = swarm.select_next_some() => {
                         mailbox_state = handle_swarm_event(
                             event, &ev_tx, &mut swarm, mailbox_state,
                             &mut mailbox_indices, &signing_key,
                         ).await;
-                        mailbox_state = check_fetching_timeout(mailbox_state);
+                        mailbox_state = check_state_timeout(mailbox_state, &ev_tx);
                     }
                     cmd = cmd_rx.recv() => {
                         let Some(cmd) = cmd else { break; };
@@ -236,7 +239,7 @@ impl P2PNode {
                             &mut swarm, cmd, &ev_tx, mailbox_state,
                             &mut mailbox_indices, &signing_key,
                         ).await;
-                        mailbox_state = check_fetching_timeout(mailbox_state);
+                        mailbox_state = check_state_timeout(mailbox_state, &ev_tx);
                     }
                 }
             }
@@ -419,8 +422,8 @@ async fn handle_found_record(
         }
 
         // ── CollectingMessages: collect and verify ──
-        CollectingMessages { user_hash, messages, remaining } => {
-            collect_message(user_hash, remaining, value, key, ev_tx, swarm, messages).await
+        CollectingMessages { user_hash, messages, remaining, deadline } => {
+            collect_message(user_hash, remaining, value, key, ev_tx, swarm, messages, deadline).await
         }
 
         // ── Idle: standalone DHT get_record result ──
@@ -457,9 +460,9 @@ async fn handle_not_found(
             mailbox_indices.insert(user_hash.clone(), max_found);
             resume_pending_command(&pending_command, max_found, ev_tx, swarm, mailbox_indices, signing_key).await
         }
-        CollectingMessages { user_hash, messages, remaining } => {
+        CollectingMessages { user_hash, messages, remaining, deadline } => {
             // Seq doesn't exist — skip it and continue
-            collect_message(user_hash, remaining, None, Vec::new(), ev_tx, swarm, messages).await
+            collect_message(user_hash, remaining, None, Vec::new(), ev_tx, swarm, messages, deadline).await
         }
         Idle => Idle,
     }
@@ -537,6 +540,7 @@ async fn resume_pending_command(
                     user_hash: user_hash.clone(),
                     messages: vec![],
                     remaining,
+                    deadline: Instant::now() + Duration::from_secs(30),
                 }
             }
         }
@@ -544,6 +548,7 @@ async fn resume_pending_command(
 }
 
 /// Collect a message from DHT, verify its envelope, and continue or emit.
+/// The `deadline` is preserved from the parent `CollectingMessages` state.
 async fn collect_message(
     user_hash: Vec<u8>,
     mut remaining: Vec<u64>,
@@ -552,6 +557,7 @@ async fn collect_message(
     ev_tx: &mpsc::Sender<NodeEvent>,
     swarm: &mut libp2p::Swarm<NodeBehaviour>,
     mut messages: Vec<Vec<u8>>,
+    deadline: std::time::Instant,
 ) -> MailboxState {
     if remaining.is_empty() {
         let _ = ev_tx.send(NodeEvent::MailboxRetrieved {
@@ -599,6 +605,7 @@ async fn collect_message(
             user_hash,
             messages,
             remaining,
+            deadline,
         }
     }
 }
@@ -769,6 +776,7 @@ async fn handle_command(
                     user_hash,
                     messages: vec![],
                     remaining,
+                    deadline: Instant::now() + Duration::from_secs(30),
                 };
             }
 
@@ -801,12 +809,32 @@ async fn handle_command(
     }
 }
 
-/// If the state is `FetchingIndex` and its deadline has passed, fall back to `Idle`.
-/// This prevents the state machine from hanging indefinitely if the DHT is unreachable.
-fn check_fetching_timeout(state: MailboxState) -> MailboxState {
+/// If a state-machine state has exceeded its deadline, fall back to `Idle`.
+/// - `FetchingIndex`: just resets (no messages to emit).
+/// - `CollectingMessages`: emits whatever messages were collected so far.
+///
+/// This prevents the event loop from hanging indefinitely on a slow DHT.
+fn check_state_timeout(
+    state: MailboxState,
+    ev_tx: &mpsc::Sender<NodeEvent>,
+) -> MailboxState {
     match state {
         MailboxState::FetchingIndex { deadline, .. } if Instant::now() >= deadline => {
             warn!("FetchingIndex timed out (30s), falling back to Idle");
+            MailboxState::Idle
+        }
+        MailboxState::CollectingMessages { user_hash, messages, deadline, .. }
+            if Instant::now() >= deadline =>
+        {
+            warn!(
+                "CollectingMessages timed out (30s), emitting {} collected msgs for {}",
+                messages.len(),
+                hex_fmt(&user_hash, 8),
+            );
+            let _ = ev_tx.try_send(NodeEvent::MailboxRetrieved {
+                user_hash,
+                messages,
+            });
             MailboxState::Idle
         }
         _ => state,
