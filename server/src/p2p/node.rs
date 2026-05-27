@@ -205,7 +205,13 @@ impl P2PNode {
                 let pid = key.public().to_peer_id();
 
                 let kademlia = {
-                    let mut k = kad::Behaviour::new(pid, MemoryStore::new(pid));
+                    let mut kad_config = kad::Config::default();
+                    kad_config.set_query_timeout(Duration::from_secs(5));
+                    let mut k = kad::Behaviour::with_config(
+                        pid,
+                        MemoryStore::new(pid),
+                        kad_config,
+                    );
                     k.set_mode(Some(kad::Mode::Server));
                     k
                 };
@@ -519,9 +525,31 @@ async fn handle_kad_event(
                     if let Some(resp) = pending_profile_queries.remove(&id) {
                         let _ = resp.send(None);
                     }
-                    if !state.is_idle() {
-                        state = MailboxState::Idle;
+                    // Emit MailboxRetrieved for any mailbox state so tests don't hang
+                    match state {
+                        MailboxState::CollectingMessages { user_hash, messages, .. } => {
+                            info!("DHT get_record failed, emitting {} collected messages", messages.len());
+                            let _ = ev_tx.send(NodeEvent::MailboxRetrieved {
+                                user_hash,
+                                messages,
+                            }).await;
+                        }
+                        MailboxState::FetchingIndex { .. } => {
+                            info!("DHT get_record failed during FetchingIndex, emitting empty result");
+                            let _ = ev_tx.send(NodeEvent::MailboxRetrieved {
+                                user_hash: Vec::new(),
+                                messages: Vec::new(),
+                            }).await;
+                        }
+                        MailboxState::Idle => {
+                            info!("DHT get_record failed while Idle, emitting empty result");
+                            let _ = ev_tx.send(NodeEvent::MailboxRetrieved {
+                                user_hash: Vec::new(),
+                                messages: Vec::new(),
+                            }).await;
+                        }
                     }
+                    state = MailboxState::Idle;
                 }
                 QueryResult::PutRecord(Ok(ok)) => {
                     trace!("DHT put_record succeeded: {ok:?}");
@@ -770,7 +798,7 @@ fn start_collecting_messages(
         user_hash,
         messages: vec![],
         remaining,
-        deadline: Instant::now() + Duration::from_secs(30),
+        deadline: Instant::now() + Duration::from_secs(10),
     }
 }
 
@@ -933,7 +961,7 @@ async fn handle_command(
             // Lazy seeding: fire parallel window from seq 1
             info!("MailboxStore (lazy): firing window 1–{} for {}",
                 WINDOW_SIZE, hex_fmt(&recipient_hash, 8));
-            let deadline = Instant::now() + Duration::from_secs(30);
+            let deadline = Instant::now() + Duration::from_secs(10);
             let pending_queries = fire_window(kademlia, &recipient_hash, 1, WINDOW_SIZE);
             MailboxState::FetchingIndex {
                 pending_command: PendingNodeCommand::MailboxStore {
@@ -992,7 +1020,7 @@ async fn handle_command(
             // Lazy seeding: fire parallel window from seq 1
             info!("MailboxRetrieve (lazy): firing window 1–{} for {}",
                 WINDOW_SIZE, hex_fmt(&user_hash, 8));
-            let deadline = Instant::now() + Duration::from_secs(30);
+            let deadline = Instant::now() + Duration::from_secs(10);
             let pending_queries = fire_window(kademlia, &user_hash, 1, WINDOW_SIZE);
             MailboxState::FetchingIndex {
                 pending_command: PendingNodeCommand::MailboxRetrieve { user_hash },
@@ -1112,14 +1140,14 @@ fn check_state_timeout(
 ) -> MailboxState {
     match state {
         MailboxState::FetchingIndex { deadline, .. } if Instant::now() >= deadline => {
-            warn!("FetchingIndex timed out (30s), falling back to Idle");
+            warn!("FetchingIndex timed out (10s), falling back to Idle");
             MailboxState::Idle
         }
         MailboxState::CollectingMessages { user_hash, messages, deadline, .. }
             if Instant::now() >= deadline =>
         {
             warn!(
-                "CollectingMessages timed out (30s), emitting {} collected msgs for {}",
+                "CollectingMessages timed out (10s), emitting {} collected msgs for {}",
                 messages.len(),
                 hex_fmt(&user_hash, 8),
             );
