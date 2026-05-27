@@ -14,7 +14,10 @@
 //! Collected `DhtEnvelope`s are verified by Ed25519 signature before emission.
 //! Invalid signatures are silently dropped (spam/forgery resistance).
 
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 use ed25519_dalek::SigningKey;
 use futures::StreamExt;
 use kad::store::MemoryStore;
@@ -108,12 +111,15 @@ impl PendingNodeCommand {
 enum MailboxState {
     Idle,
     /// Speculatively probing DHT seq 1, 2, 3... until finding a gap.
+    /// Falls back to Idle after 30 seconds if no DHT response arrives.
     FetchingIndex {
         pending_command: PendingNodeCommand,
         /// Next seq to probe (starts at 1, increments on each FoundRecord)
         probe_seq: u64,
         /// Highest consecutively verified seq found
         max_found: u64,
+        /// Deadline: if exceeded, transition to Idle to avoid hanging
+        deadline: std::time::Instant,
     },
     /// Collecting individual seq messages after index was determined.
     CollectingMessages {
@@ -208,13 +214,21 @@ impl P2PNode {
             let mut mailbox_state = MailboxState::Idle;
             let mut mailbox_indices: HashMap<Vec<u8>, u64> = HashMap::new();
 
+            // Timeout polling: every 5 seconds, check if FetchingIndex has expired.
+            // This is only awaited when both swarm events and commands are idle.
+            let mut timeout_tick = tokio::time::interval(Duration::from_secs(5));
+
             loop {
                 tokio::select! {
+                    _ = timeout_tick.tick() => {
+                        mailbox_state = check_fetching_timeout(mailbox_state);
+                    }
                     event = swarm.select_next_some() => {
                         mailbox_state = handle_swarm_event(
                             event, &ev_tx, &mut swarm, mailbox_state,
                             &mut mailbox_indices, &signing_key,
                         ).await;
+                        mailbox_state = check_fetching_timeout(mailbox_state);
                     }
                     cmd = cmd_rx.recv() => {
                         let Some(cmd) = cmd else { break; };
@@ -222,6 +236,7 @@ impl P2PNode {
                             &mut swarm, cmd, &ev_tx, mailbox_state,
                             &mut mailbox_indices, &signing_key,
                         ).await;
+                        mailbox_state = check_fetching_timeout(mailbox_state);
                     }
                 }
             }
@@ -368,7 +383,7 @@ async fn handle_found_record(
 
     match state {
         // ── FetchingIndex: we got a record at probe_seq ──
-        FetchingIndex { pending_command, probe_seq, max_found } => {
+        FetchingIndex { pending_command, probe_seq, max_found, deadline } => {
             let user_hash = pending_command.user_hash().to_vec();
 
             // Try to verify the envelope
@@ -391,6 +406,7 @@ async fn handle_found_record(
                     pending_command,
                     probe_seq: next_seq,
                     max_found: probe_seq,
+                    deadline,
                 }
             } else {
                 // Gap found — this seq doesn't exist or is invalid
@@ -433,7 +449,7 @@ async fn handle_not_found(
     use MailboxState::*;
 
     match state {
-        FetchingIndex { pending_command, probe_seq, max_found } => {
+        FetchingIndex { pending_command, probe_seq, max_found, deadline: _ } => {
             let user_hash = pending_command.user_hash().to_vec();
             // DHT says this seq doesn't exist — gap found
             info!("FetchingIndex: seq {probe_seq} not in DHT for {}, index={max_found}",
@@ -722,6 +738,7 @@ async fn handle_command(
                 },
                 probe_seq: 1,
                 max_found: 0,
+                deadline: Instant::now() + Duration::from_secs(30),
             }
         }
 
@@ -764,6 +781,7 @@ async fn handle_command(
                 pending_command: PendingNodeCommand::MailboxRetrieve { user_hash },
                 probe_seq: 1,
                 max_found: 0,
+                deadline: Instant::now() + Duration::from_secs(30),
             }
         }
 
@@ -780,6 +798,18 @@ async fn handle_command(
             let _ = kademlia.bootstrap();
             mailbox_state
         }
+    }
+}
+
+/// If the state is `FetchingIndex` and its deadline has passed, fall back to `Idle`.
+/// This prevents the state machine from hanging indefinitely if the DHT is unreachable.
+fn check_fetching_timeout(state: MailboxState) -> MailboxState {
+    match state {
+        MailboxState::FetchingIndex { deadline, .. } if Instant::now() >= deadline => {
+            warn!("FetchingIndex timed out (30s), falling back to Idle");
+            MailboxState::Idle
+        }
+        _ => state,
     }
 }
 
