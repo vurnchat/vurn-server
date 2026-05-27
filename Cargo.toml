@@ -2,7 +2,6 @@
 members = [
     "core",
     "server",
-    "web-client",
 ]
 
 resolver = "2"
@@ -11,5 +10,5 @@ resolver = "2"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/vurnchat/vurn-chat"
+repository = "https://github.com/vurnchat/vurn-server"
 authors = ["VurnChat Contributors"]
