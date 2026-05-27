@@ -30,7 +30,7 @@ use libp2p::{
 use tokio::sync::mpsc;
 use tracing::{info, warn, trace};
 
-use libp2p::{kad, gossipsub, identify};
+use libp2p::{kad, gossipsub, identify, relay, dcutr};
 
 use crate::p2p::dht;
 use crate::mailbox::SLED_MAILBOX_TREE;
@@ -47,6 +47,8 @@ pub struct NodeBehaviour {
     pub gossipsub: gossipsub::Behaviour,
     pub identify: identify::Behaviour,
     pub ping: libp2p::ping::Behaviour,
+    pub relay: relay::Behaviour,
+    pub dcutr: dcutr::Behaviour,
 }
 
 #[derive(Debug)]
@@ -55,6 +57,8 @@ pub enum NodeBehaviourEvent {
     Gossipsub(gossipsub::Event),
     Identify(identify::Event),
     Ping(libp2p::ping::Event),
+    Relay(relay::Event),
+    Dcutr(dcutr::Event),
 }
 
 impl From<kad::Event> for NodeBehaviourEvent {
@@ -69,12 +73,18 @@ impl From<identify::Event> for NodeBehaviourEvent {
 impl From<libp2p::ping::Event> for NodeBehaviourEvent {
     fn from(e: libp2p::ping::Event) -> Self { NodeBehaviourEvent::Ping(e) }
 }
+impl From<relay::Event> for NodeBehaviourEvent {
+    fn from(e: relay::Event) -> Self { NodeBehaviourEvent::Relay(e) }
+}
+impl From<dcutr::Event> for NodeBehaviourEvent {
+    fn from(e: dcutr::Event) -> Self { NodeBehaviourEvent::Dcutr(e) }
+}
 
 // ── Events & Commands ──────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub enum NodeEvent {
-    MessageReceived { from: PeerId, data: Vec<u8> },
+    MessageReceived { from: PeerId, topic: Vec<u8>, data: Vec<u8> },
     MailboxRetrieved { user_hash: Vec<u8>, messages: Vec<Vec<u8>> },
     PeerDiscovered(PeerId),
     ListeningOn(Multiaddr),
@@ -226,11 +236,16 @@ impl P2PNode {
                         .with_interval(Duration::from_secs(15)),
                 );
 
+                let relay = relay::Behaviour::new(pid, relay::Config::default());
+                let dcutr = dcutr::Behaviour::new(pid);
+
                 NodeBehaviour {
                     kademlia,
                     gossipsub,
                     identify,
                     ping,
+                    relay,
+                    dcutr,
                 }
             })?
             .build();            // ── Load persisted peers from Sled and re-dial (batched) ──
@@ -417,6 +432,14 @@ async fn handle_swarm_event(
                 } else {
                     trace!("Ping failed: peer={}", ping_event.peer);
                 }
+                mailbox_state
+            }
+            NodeBehaviourEvent::Relay(relay_event) => {
+                trace!("Relay event: {relay_event:?}");
+                mailbox_state
+            }
+            NodeBehaviourEvent::Dcutr(dcutr_event) => {
+                info!("DCUtR event: {dcutr_event:?}");
                 mailbox_state
             }
         },
@@ -857,8 +880,10 @@ fn handle_gossipsub_event(
         ..
     } = event
     {
+        let topic = message.topic.as_str().as_bytes().to_vec();
         let _ = ev_tx.send(NodeEvent::MessageReceived {
             from: propagation_source,
+            topic,
             data: message.data,
         });
     }
@@ -882,6 +907,8 @@ async fn handle_command(
         ref mut gossipsub,
         identify: _,
         ping: _,
+        relay: _,
+        dcutr: _,
     } = swarm.behaviour_mut();
 
     match cmd {

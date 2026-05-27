@@ -15,7 +15,7 @@
 use rustls::{pki_types::PrivateKeyDer, ServerConfig};
 use std::{fs::File, io::BufReader, sync::Arc};
 use tokio::sync::{mpsc, RwLock};
-use tracing::{info, warn, error};
+use tracing::{error, info, trace, warn};
 
 mod p2p;
 mod ws;
@@ -229,6 +229,12 @@ async fn main() {
 
 // ── P2P Event Handler ──────────────────────────────────────────────
 
+/// Set the P2P connected flag in the WebSocket gateway state.
+async fn set_p2p_connected(ws_state: &ws::SharedState, connected: bool) {
+    let mut map = ws_state.write().await;
+    map.p2p_connected = connected;
+}
+
 async fn handle_p2p_events(
     rx: &mut mpsc::Receiver<NodeEvent>,
     ws_state: &ws::SharedState,
@@ -237,12 +243,28 @@ async fn handle_p2p_events(
 ) {
     while let Some(event) = rx.recv().await {
         match event {
-            NodeEvent::MessageReceived { from, data } => {
-                info!("P2P message from {from} ({} bytes)", data.len());
-                let map = ws_state.read().await;
-                for (_, senders) in map.clients.iter() {
-                    for tx in senders {
-                        let _ = tx.send(data.clone());
+            NodeEvent::MessageReceived { from, topic, data } => {
+                // If topic is present (GossipSub), route to the specific recipient
+                if !topic.is_empty() {
+                    if let Ok(recipient_id) = hex::decode(&topic) {
+                        let map = ws_state.read().await;
+                        if let Some(senders) = map.clients.get(&recipient_id) {
+                            info!("GossipSub message from {from} routed to recipient ({} bytes)", data.len());
+                            for tx in senders {
+                                let _ = tx.send(data.clone());
+                            }
+                        } else {
+                            trace!("GossipSub message for {}/{}b — recipient not connected on this node",
+                                ws::hex_fmt(&recipient_id, 8), data.len());
+                        }
+                    }
+                } else {
+                    info!("P2P message from {from} ({} bytes)", data.len());
+                    let map = ws_state.read().await;
+                    for (_, senders) in map.clients.iter() {
+                        for tx in senders {
+                            let _ = tx.send(data.clone());
+                        }
                     }
                 }
             }
@@ -272,11 +294,13 @@ async fn handle_p2p_events(
             }
             NodeEvent::PeerDiscovered(peer_id) => {
                 info!("P2P peer discovered: {peer_id}");
+                set_p2p_connected(ws_state, true).await;
                 // Bootstrap DHT to populate routing table with this peer
                 let _ = p2p_cmd_tx.send(NodeCommand::Bootstrap).await;
             }
             NodeEvent::ListeningOn(addr) => {
                 info!("P2P listening on: {addr}");
+                set_p2p_connected(ws_state, true).await;
                 // Bootstrap DHT now that we have a listen address
                 let _ = p2p_cmd_tx.send(NodeCommand::Bootstrap).await;
             }

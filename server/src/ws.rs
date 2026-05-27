@@ -10,6 +10,7 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         State,
     },
+    http::StatusCode,
     response::IntoResponse,
     routing::get,
     Router,
@@ -17,7 +18,7 @@ use axum::{
 use futures_util::{sink::SinkExt, stream::StreamExt};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
-use tracing::{error, info, warn};
+use tracing::{error, info, trace, warn};
 
 use crate::p2p::NodeCommand;
 use tokio::sync::oneshot;
@@ -27,7 +28,49 @@ use tokio::sync::oneshot;
 const PROFILE_SUCCESS: [u8; 3] = [0xFE, 0x00, 0x00];
 const PROFILE_OCCUPIED: [u8; 3] = [0xFF, 0x00, 0x01];
 
+/// Rate limit: max store operations per second per client
+const RATE_LIMIT_STORE_PER_SEC: f64 = 10.0;
+/// Rate limit: max retrieve/lookup operations per second per client
+const RATE_LIMIT_LOOKUP_PER_SEC: f64 = 1.0;
+
 // ── Shared state ────────────────────────────────────────────────────
+
+/// Simple token bucket for rate limiting.
+#[derive(Clone)]
+pub struct TokenBucket {
+    tokens: f64,
+    last_refill: std::time::Instant,
+    rate: f64,
+    capacity: f64,
+}
+
+impl TokenBucket {
+    pub fn new(rate: f64, capacity: f64) -> Self {
+        Self {
+            tokens: capacity,
+            last_refill: std::time::Instant::now(),
+            rate,
+            capacity,
+        }
+    }
+
+    /// Try to consume `n` tokens. Returns `true` if allowed.
+    pub fn try_consume(&mut self, n: f64) -> bool {
+        self.refill();
+        if self.tokens >= n {
+            self.tokens -= n;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn refill(&mut self) {
+        let elapsed = self.last_refill.elapsed().as_secs_f64();
+        self.tokens = (self.tokens + elapsed * self.rate).min(self.capacity);
+        self.last_refill = std::time::Instant::now();
+    }
+}
 
 /// Internal state of the WebSocket gateway.
 pub struct GatewayStateInner {
@@ -35,6 +78,10 @@ pub struct GatewayStateInner {
     pub clients: HashMap<Vec<u8>, Vec<mpsc::UnboundedSender<Vec<u8>>>>,
     /// P2P node command channel (for DHT mailbox storage and profiles)
     pub p2p_cmd_tx: Option<mpsc::Sender<NodeCommand>>,
+    /// Whether the P2P node has at least one connection
+    pub p2p_connected: bool,
+    /// Per-client rate limiters: session_id → (store_bucket, lookup_bucket)
+    pub rate_limiters: HashMap<Vec<u8>, (TokenBucket, TokenBucket)>,
 }
 
 use std::collections::HashMap;
@@ -44,6 +91,8 @@ impl Default for GatewayStateInner {
         Self {
             clients: HashMap::new(),
             p2p_cmd_tx: None,
+            p2p_connected: false,
+            rate_limiters: HashMap::new(),
         }
     }
 }
@@ -53,7 +102,21 @@ pub type SharedState = Arc<RwLock<GatewayStateInner>>;
 // ── Router ──────────────────────────────────────────────────────────
 
 pub fn build_gateway_router() -> Router<SharedState> {
-    Router::new().route("/ws", get(ws_handler))
+    Router::new()
+        .route("/ws", get(ws_handler))
+        .route("/health", get(health_handler))
+}
+
+/// GET /health — returns 200 if the gateway and P2P node are operational.
+async fn health_handler(
+    State(gateway_state): State<SharedState>,
+) -> impl IntoResponse {
+    let map = gateway_state.read().await;
+    if map.p2p_connected {
+        (StatusCode::OK, "OK\n")
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "P2P not connected\n")
+    }
 }
 
 // ── WebSocket upgrade ───────────────────────────────────────────────
@@ -93,6 +156,25 @@ async fn handle_ws_connection(socket: WebSocket, gateway_state: SharedState) {
     }
 
     info!("Client registered: {}", hex_fmt(&session_id, 8));
+
+    // Subscribe to GossipSub topic for realtime delivery
+    {
+        let map = gateway_state.read().await;
+        if let Some(ref cmd_tx) = map.p2p_cmd_tx {
+            let topic = hex::encode(&session_id);
+            let _ = cmd_tx.send(NodeCommand::Subscribe { topic }).await;
+            info!("Subscribed to GossipSub topic for {}", hex_fmt(&session_id, 8));
+        }
+    }
+
+    // Init rate limiters for this client
+    {
+        let mut map = gateway_state.write().await;
+        map.rate_limiters.insert(session_id.to_vec(), (
+            TokenBucket::new(RATE_LIMIT_STORE_PER_SEC, RATE_LIMIT_STORE_PER_SEC),
+            TokenBucket::new(RATE_LIMIT_LOOKUP_PER_SEC, RATE_LIMIT_LOOKUP_PER_SEC),
+        ));
+    }
 
     // Trigger DHT mailbox retrieval for offline messages
     {
@@ -160,6 +242,9 @@ async fn handle_ws_connection(socket: WebSocket, gateway_state: SharedState) {
     info!("Client disconnected: {}", hex_fmt(&session_id, 8));
     {
         let mut map = gateway_state.write().await;
+        // Remove rate limiters for this client
+        map.rate_limiters.remove(session_id.as_ref());
+        // Clean up senders
         if let Some(senders) = map.clients.get_mut(session_id.as_ref()) {
             senders.retain(|s| !s.is_closed());
             if senders.is_empty() {
@@ -172,7 +257,25 @@ async fn handle_ws_connection(socket: WebSocket, gateway_state: SharedState) {
 
 // ── Relay ───────────────────────────────────────────────────────────
 
-/// Try local delivery first, else store in P2P DHT mailbox.
+/// Check if a client has exceeded their rate limit for store operations.
+fn check_rate_limit_store(state: &mut GatewayStateInner, client_id: &[u8]) -> bool {
+    if let Some((ref mut store_bucket, _)) = state.rate_limiters.get_mut(client_id) {
+        store_bucket.try_consume(1.0)
+    } else {
+        true // no rate limiter = allow
+    }
+}
+
+/// Check if a client has exceeded their rate limit for lookup operations.
+fn check_rate_limit_lookup(state: &mut GatewayStateInner, client_id: &[u8]) -> bool {
+    if let Some((_, ref mut lookup_bucket)) = state.rate_limiters.get_mut(client_id) {
+        lookup_bucket.try_consume(1.0)
+    } else {
+        true
+    }
+}
+
+/// Try local delivery first, else GossipSub, else store in DHT mailbox.
 async fn relay_or_p2p(state: &SharedState, sender_id: &[u8], data: &[u8]) {
     if data.len() < 2 {
         return;
@@ -187,6 +290,15 @@ async fn relay_or_p2p(state: &SharedState, sender_id: &[u8], data: &[u8]) {
     let payload = &data[2 + id_len..];
     if payload.is_empty() {
         return;
+    }
+
+    // Rate limit: max 10 store operations per second per client
+    {
+        let mut map = state.write().await;
+        if !check_rate_limit_store(&mut map, sender_id) {
+            warn!("Rate limit exceeded for store: {}", hex_fmt(sender_id, 8));
+            return;
+        }
     }
 
     // Build forward frame
@@ -216,22 +328,38 @@ async fn relay_or_p2p(state: &SharedState, sender_id: &[u8], data: &[u8]) {
         return;
     }
 
-    // Store in sequential DHT mailbox via P2P node
+    // Try GossipSub realtime delivery (for recipients on other nodes)
+    {
+        let map = state.read().await;
+        if let Some(ref cmd_tx) = map.p2p_cmd_tx {
+            let topic = hex::encode(recipient_id);
+            let cmd = NodeCommand::Publish {
+                topic: topic.clone(),
+                data: forward.clone(),
+            };
+            let _ = cmd_tx.send(cmd).await;
+            trace!("GossipSub publish to topic {} for {}", topic, hex_fmt(recipient_id, 8));
+        }
+    }
+
+    // Store in sequential DHT mailbox via P2P node (durable offline store)
     info!(
         "MailboxStore: queueing {}b for {}",
         payload.len(),
         hex_fmt(recipient_id, 8)
     );
 
-    let map = state.read().await;
-    if let Some(ref cmd_tx) = map.p2p_cmd_tx {
-        let cmd = NodeCommand::MailboxStore {
-            recipient_hash: recipient_id.to_vec(),
-            sender_hash: sender_id.to_vec(),
-            payload: payload.to_vec(),
-        };
-        if let Err(e) = cmd_tx.send(cmd).await {
-            warn!("Failed to send MailboxStore: {e}");
+    {
+        let map = state.read().await;
+        if let Some(ref cmd_tx) = map.p2p_cmd_tx {
+            let cmd = NodeCommand::MailboxStore {
+                recipient_hash: recipient_id.to_vec(),
+                sender_hash: sender_id.to_vec(),
+                payload: payload.to_vec(),
+            };
+            if let Err(e) = cmd_tx.send(cmd).await {
+                warn!("Failed to send MailboxStore: {e}");
+            }
         }
     }
 }
