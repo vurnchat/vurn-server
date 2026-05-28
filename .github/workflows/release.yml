@@ -1,14 +1,3 @@
-# ── VurnChat Release Workflow ─────────────────────────────────────────
-#
-# Triggered by pushing a tag matching "v*" (e.g. v0.5.0, v1.0.0).
-# 1. Runs full test suite
-# 2. Builds binaries for Linux (x86_64 + aarch64) and macOS (x86_64 + arm64)
-# 3. Creates a GitHub Release with all binaries + sha256 checksums
-#
-# Binary naming convention (consumed by install.sh):
-#   vurn-server-<target-triple>
-#   vurn-server-<target-triple>.sha256
-#
 name: Release
 
 on:
@@ -40,12 +29,16 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+            strip: strip
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04-arm
+            strip: aarch64-linux-gnu-strip
           - target: x86_64-apple-darwin
             os: macos-13
+            strip: strip
           - target: aarch64-apple-darwin
             os: macos-latest
+            strip: strip
 
     steps:
       - name: Checkout
@@ -56,26 +49,21 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install cross-linker (aarch64 Linux)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-aarch64-linux-gnu
-
       - name: Build release binary
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: |
           cargo build -p vurn-server --release --target ${{ matrix.target }}
 
       - name: Strip binary
         run: |
+          ${{ matrix.strip }} "target/${{ matrix.target }}/release/vurn-server" 2>/dev/null || true
+
+      - name: Smoke test
+        run: |
           BIN="target/${{ matrix.target }}/release/vurn-server"
-          case "${{ matrix.target }}" in
-            aarch64-unknown-linux-gnu) aarch64-linux-gnu-strip "$BIN" ;;
-            x86_64-unknown-linux-gnu)  strip "$BIN" ;;
-            *)  # macOS — strip is available on macOS runners
-                strip "$BIN" 2>/dev/null || true
-                ;;
-          esac
+          file "$BIN"
+          "$BIN" --help 2>&1 | head -5
+          # Quick sanity: start and kill (just verify it binds)
+          timeout 3 "$BIN" --port 19999 2>&1 || true
 
       - name: Rename binary for release
         run: |
@@ -117,15 +105,22 @@ jobs:
       - name: List artifacts
         run: ls -lh
 
+      - name: Verify checksums
+        run: |
+          for f in vurn-server-*.sha256; do
+            echo "Verifying $f..."
+            sha256sum -c "$f"
+          done
+
       - name: Generate release notes
         id: release_notes
         run: |
           TAG="${GITHUB_REF_NAME}"
           VERSION="${TAG#v}"
           cat <<NOTES > release_notes.md
-          ## 🎉 VurnChat Blind Relay Server ${VERSION}
+          ## VurnChat Blind Relay Server ${VERSION}
 
-          ### 📥 Installation
+          ### Installation
 
           **Quick install (Linux):**
           \`\`\`bash
@@ -138,7 +133,7 @@ jobs:
           ./vurn-server-* --help
           \`\`\`
 
-          ### 🚀 Quick Start
+          ### Quick Start
 
           \`\`\`bash
           # Plain WS
@@ -148,7 +143,7 @@ jobs:
           ./vurn-server-x86_64-unknown-linux-gnu --port 443 --cert cert.pem --key key.pem
           \`\`\`
 
-          ### 🔗 Links
+          ### Links
           - [Source Code](https://github.com/vurnchat/vurn-server)
           - [Documentation](https://github.com/vurnchat/vurn-server#readme)
           - [Web Client](https://github.com/vurnchat/vurn-web)

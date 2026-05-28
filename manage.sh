@@ -188,14 +188,15 @@ ENVEOF
         echo "VURN_CERT=${CERT_PATH}" | $SUDO tee -a "$ENV_FILE" > /dev/null
         echo "VURN_KEY=${KEY_PATH}" | $SUDO tee -a "$ENV_FILE" > /dev/null
     fi
+
+    if [[ ${#BOOTSTRAP_ADDRS[@]} -gt 0 ]]; then
+        echo "VURN_BOOTSTRAP=${BOOTSTRAP_ADDRS[*]}" | $SUDO tee -a "$ENV_FILE" > /dev/null
+    fi
+
     $SUDO chmod 600 "$ENV_FILE"
     $SUDO chown vurn:vurn "$ENV_FILE"
 
     info "Rebuilding systemd service..."
-    BOOTSTRAP_CMDLINE=""
-    for addr in "${BOOTSTRAP_ADDRS[@]}"; do
-        BOOTSTRAP_CMDLINE="${BOOTSTRAP_CMDLINE} --bootstrap ${addr}"
-    done
 
     $SUDO tee "$SERVICE_FILE" > /dev/null <<SERVICEEOF
 [Unit]
@@ -212,17 +213,12 @@ WorkingDirectory=${STATE_DIR}
 StateDirectory=vurn
 StateDirectoryMode=0750
 EnvironmentFile=-${ENV_FILE}
-Environment=RUST_LOG=\${VURN_LOG:-info}
 
-ExecStart=${INSTALL_PATH} \\
-    --port \${VURN_PORT:-9000} \\
-    --listen-p2p \${VURN_P2P_LISTEN:-/ip4/0.0.0.0/tcp/0} \\
-    ${BOOTSTRAP_CMDLINE} \\
-    \${VURN_CERT:+--cert \$VURN_CERT} \\
-    \${VURN_KEY:+--key \$VURN_KEY}
+ExecStart=${INSTALL_PATH}
 
 Restart=always
 RestartSec=5
+RestartMaxDelaySec=30
 MemoryMax=512M
 NoNewPrivileges=true
 ProtectSystem=strict

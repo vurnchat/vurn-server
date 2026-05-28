@@ -8,7 +8,7 @@
 //! ```text
 //! vurn-server                              # WS on :9000
 //! vurn-server --port 8080                  # WS on :8080
-//! vurn-server --cert cert.pem --key key.pem  # WSS (TLS)
+//! vurn-server --cert cert.pem --key cert.pem  # WSS (TLS)
 //! vurn-server --bootstrap /ip4/1.2.3.4/tcp/9001  # Join P2P network
 //! ```
 
@@ -23,6 +23,25 @@ mod mailbox;
 
 use p2p::{P2PNode, NodeEvent, NodeCommand};
 use mailbox::MailboxManager;
+
+fn env_or(key: &str, default: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+fn env_var(key: &str) -> Option<String> {
+    std::env::var(key).ok()
+}
+
+fn parse_bootstrap_from_env() -> Vec<String> {
+    env_var("VURN_BOOTSTRAP")
+        .iter()
+        .flat_map(|s| s.split_whitespace().map(|a| a.to_string()).collect::<Vec<_>>())
+        .collect()
+}
+
+fn parse_port_from_env() -> Option<u16> {
+    env_var("VURN_PORT")?.parse::<u16>().ok()
+}
 
 // ── Server mode ─────────────────────────────────────────────────────
 
@@ -44,12 +63,15 @@ struct CliArgs {
 impl CliArgs {
     fn parse() -> Self {
         let raw: Vec<String> = std::env::args().collect();
-        let mut ws_port = 9000u16;
-        let mut p2p_listen = "/ip4/0.0.0.0/tcp/0".to_string();
-        let mut bootstrap = Vec::new();
-        let mut cert: Option<String> = None;
-        let mut key: Option<String> = None;
 
+        // defaults: env vars first, then hardcoded
+        let mut ws_port = parse_port_from_env().unwrap_or(9000u16);
+        let mut p2p_listen = env_or("VURN_P2P_LISTEN", "/ip4/0.0.0.0/tcp/0");
+        let mut bootstrap: Vec<String> = parse_bootstrap_from_env();
+        let mut cert: Option<String> = env_var("VURN_CERT");
+        let mut key: Option<String> = env_var("VURN_KEY");
+
+        // CLI flags override env vars
         let mut i = 1;
         while i < raw.len() {
             match raw[i].as_str() {
@@ -60,11 +82,11 @@ impl CliArgs {
                     eprintln!("  vurn-server [OPTIONS]");
                     eprintln!();
                     eprintln!("Options:");
-                    eprintln!("  --port <PORT>         WS/WSS gateway port (default: 9000)");
-                    eprintln!("  --listen-p2p <ADDR>   P2P listen addr (default: /ip4/0.0.0.0/tcp/0)");
-                    eprintln!("  --bootstrap <ADDR>    Bootstrap P2P node (repeatable)");
-                    eprintln!("  --cert <FILE>         TLS certificate (enables WSS)");
-                    eprintln!("  --key <FILE>          TLS private key  (enables WSS)");
+                    eprintln!("  --port <PORT>         WS/WSS gateway port (default: 9000, env: VURN_PORT)");
+                    eprintln!("  --listen-p2p <ADDR>   P2P listen addr (default: /ip4/0.0.0.0/tcp/0, env: VURN_P2P_LISTEN)");
+                    eprintln!("  --bootstrap <ADDR>    Bootstrap P2P node (repeatable, env: VURN_BOOTSTRAP)");
+                    eprintln!("  --cert <FILE>         TLS certificate (env: VURN_CERT)");
+                    eprintln!("  --key <FILE>          TLS private key  (env: VURN_KEY)");
                     eprintln!("  --help, -h            Show this help");
                     eprintln!();
                     eprintln!("Examples:");
@@ -125,7 +147,17 @@ impl CliArgs {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls ring CryptoProvider");
+
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
     let args = CliArgs::parse();
     info!("VurnChat P2P node starting...");
 

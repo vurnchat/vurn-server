@@ -1,5 +1,5 @@
 # ── VurnChat P2P Node — systemd service ──────────────────────────────
-# Source: https://github.com/scramble22/VurnChat
+# Source: https://github.com/vurnchat/vurn-server
 #
 # Installed by: install.sh
 # Manually: sudo cp deploy/vurn.service /etc/systemd/system/vurn.service
@@ -15,7 +15,7 @@
 
 [Unit]
 Description=VurnChat — Post-Quantum Encrypted P2P Messenger Node
-Documentation=https://github.com/scramble22/VurnChat
+Documentation=https://github.com/vurnchat/vurn-server
 After=network-online.target
 Wants=network-online.target
 
@@ -37,28 +37,20 @@ StateDirectoryMode=0750
 # ── Environment ──────────────────────────────────────────────────────
 # Load config from /etc/vurn/vurn.env (created by install.sh)
 EnvironmentFile=-/etc/vurn/vurn.env
-Environment=RUST_LOG=${VURN_LOG:-info}
 
 # ── Startup command ─────────────────────────────────────────────────
-# Reads configuration from environment variables (set in vurn.env).
-# Falls back to sensible defaults if env vars are unset.
-ExecStart=/usr/local/bin/vurn-server \
-    --port ${VURN_PORT:-9000} \
-    --listen-p2p ${VURN_P2P_LISTEN:-/ip4/0.0.0.0/tcp/0} \
-    ${VURN_BOOTSTRAP:+--bootstrap $VURN_BOOTSTRAP} \
-    ${VURN_CERT:+--cert $VURN_CERT} \
-    ${VURN_KEY:+--key $VURN_KEY}
+# The binary reads env vars (VURN_PORT, VURN_CERT, VURN_KEY, VURN_P2P_LISTEN, VURN_BOOTSTRAP)
+# as fallback defaults, so we just pass the explicit flags if needed.
+# VURN_CERT/VURN_KEY trigger TLS mode automatically when set.
+ExecStart=/usr/local/bin/vurn-server
 
 # ── Restart policy ──────────────────────────────────────────────────
 Restart=always
 RestartSec=5
-StartLimitIntervalSec=300
-StartLimitBurst=10
+RestartMaxDelaySec=30
 
 # ── Resource limits ─────────────────────────────────────────────────
-# 512 MB max RSS (adjust for your workload)
 MemoryMax=512M
-# 10 GB disk write limit per second (prevents Sled from flooding disk)
 IOWriteBandwidthMax=/var/lib/vurn 10M
 
 # ── Security hardening ──────────────────────────────────────────────
@@ -78,7 +70,6 @@ SystemCallArchitectures=native
 SystemCallFilter=@system-service
 
 # ── File descriptor limit ───────────────────────────────────────────
-# libp2p + WebSocket connections: 1024 should be plenty for a relay node.
 LimitNOFILE=1024
 
 [Install]
