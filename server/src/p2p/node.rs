@@ -239,7 +239,15 @@ impl P2PNode {
                         .with_interval(Duration::from_secs(15)),
                 );
 
-                let relay = relay::Behaviour::new(pid, relay::Config::default());
+                // Relay server: enables NAT traversal through this node
+                let relay = relay::Behaviour::new(
+                    pid,
+                    relay::Config {
+                        max_reservations: 256,         // allow up to 256 peers to relay through us
+                        reservation_duration: Duration::from_secs(3600), // 1 hour reservations
+                        ..Default::default()
+                    },
+                );
                 let dcutr = dcutr::Behaviour::new(pid);
 
                 NodeBehaviour {
