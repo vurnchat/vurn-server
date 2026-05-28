@@ -123,12 +123,8 @@ impl CliArgs {
 
 // ── Main ────────────────────────────────────────────────────────────
 
-    #[tokio::main]
-    async fn main() {
-        // Ensure a crypto provider is installed for rustls 0.23
-        // Using the `ring` provider which is enabled via Cargo features.
-        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider())
-            .expect("Failed to install rustls crypto provider");
+#[tokio::main]
+async fn main() {
     tracing_subscriber::fmt::init();
     let args = CliArgs::parse();
     info!("VurnChat P2P node starting...");

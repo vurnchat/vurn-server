@@ -11,7 +11,7 @@
 //! ## DhtEnvelope
 //!
 //! Every Kademlia record is wrapped in a signed envelope:
-//! ```text
+//! ```rust
 //! DhtEnvelope {
 //!     payload,       // Already E2E encrypted (ML-KEM + AES-GCM) — opaque to the P2P layer
 //!     seq,           // Ordering number, must match position in DHT key
