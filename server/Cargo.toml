@@ -43,4 +43,4 @@ hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
 tower = "0.4"
 
 # HTTP client for auto-fetching bootstrap node list from GitHub
-ureq = { version = "3", default-features = false, features = ["_tls"] }
+ureq = { version = "3", default-features = false, features = ["rustls"] }
