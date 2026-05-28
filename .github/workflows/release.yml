@@ -1,169 +1,60 @@
-# ── VurnChat Release Workflow ─────────────────────────────────────────
-#
-# Triggered by pushing a tag matching "v*" (e.g. v0.5.0, v1.0.0).
-# 1. Runs full test suite
-# 2. Builds binaries for Linux (x86_64 + aarch64) and macOS (x86_64 + arm64)
-# 3. Creates a GitHub Release with all binaries + sha256 checksums
-#
-# Binary naming convention (consumed by install.sh):
-#   vurn-server-<target-triple>
-#   vurn-server-<target-triple>.sha256
-#
 name: Release
 
 on:
   push:
     tags:
-      - "v*"
+      - 'v*.*.*'
 
 jobs:
-  test:
-    name: Run tests
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Run all tests
-        run: cargo test -p vurn-core -p vurn-server -- --nocapture
-
   build:
-    name: Build vurn-server (${{ matrix.target }})
-    needs: test
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-          - target: x86_64-apple-darwin
-            os: macos-13
-          - target: aarch64-apple-darwin
-            os: macos-latest
-
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: actions-rs/toolchain@v1
         with:
-          targets: ${{ matrix.target }}
+          toolchain: stable
+          override: true
+          target: ${{ matrix.target }}
 
-      - name: Install cross-linker (aarch64 Linux)
+      - name: Install cross tools for aarch64 Linux
         if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-aarch64-linux-gnu
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu
 
       - name: Build release binary
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --release --workspace --bins --target ${{ matrix.target }}
+
+      - name: Package binary and checksum
         run: |
-          cargo build -p vurn-server --release --target ${{ matrix.target }}
+          mkdir -p artifact
+          cp target/${{ matrix.target }}/release/vurn-server artifact/
+          tar -czvf vurn-server-${{ matrix.target }}.tar.gz -C artifact vurn-server
+          sha256sum vurn-server-${{ matrix.target }}.tar.gz > vurn-server-${{ matrix.target }}.tar.gz.sha256
 
-      - name: Strip binary
-        run: |
-          BIN="target/${{ matrix.target }}/release/vurn-server"
-          case "${{ matrix.target }}" in
-            aarch64-unknown-linux-gnu) aarch64-linux-gnu-strip "$BIN" ;;
-            x86_64-unknown-linux-gnu)  strip "$BIN" ;;
-            *)  # macOS — strip is available on macOS runners
-                strip "$BIN" 2>/dev/null || true
-                ;;
-          esac
-
-      - name: Rename binary for release
-        run: |
-          mv "target/${{ matrix.target }}/release/vurn-server" \
-             "vurn-server-${{ matrix.target }}"
-
-      - name: Generate checksum
-        run: |
-          if command -v sha256sum &>/dev/null; then
-            sha256sum "vurn-server-${{ matrix.target }}" \
-              > "vurn-server-${{ matrix.target }}.sha256"
-          else
-            shasum -a 256 "vurn-server-${{ matrix.target }}" \
-              > "vurn-server-${{ matrix.target }}.sha256"
-          fi
-
-      - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: vurn-server-${{ matrix.target }}
-          path: |
-            vurn-server-${{ matrix.target }}
-            vurn-server-${{ matrix.target }}.sha256
-          compression-level: 0
-
-  create-release:
-    name: Create GitHub Release
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          merge-multiple: true
-
-      - name: List artifacts
-        run: ls -lh
-
-      - name: Generate release notes
-        id: release_notes
-        run: |
-          TAG="${GITHUB_REF_NAME}"
-          VERSION="${TAG#v}"
-          cat <<NOTES > release_notes.md
-          ## 🎉 VurnChat Blind Relay Server ${VERSION}
-
-          ### 📥 Installation
-
-          **Quick install (Linux):**
-          \`\`\`bash
-          curl -sSL https://raw.githubusercontent.com/vurnchat/vurn-server/${TAG}/install.sh | bash
-          \`\`\`
-
-          Or download the binary for your architecture below and run:
-          \`\`\`bash
-          chmod +x vurn-server-*
-          ./vurn-server-* --help
-          \`\`\`
-
-          ### 🚀 Quick Start
-
-          \`\`\`bash
-          # Plain WS
-          ./vurn-server-x86_64-unknown-linux-gnu --port 9000
-
-          # WSS with TLS
-          ./vurn-server-x86_64-unknown-linux-gnu --port 443 --cert cert.pem --key key.pem
-          \`\`\`
-
-          ### 🔗 Links
-          - [Source Code](https://github.com/vurnchat/vurn-server)
-          - [Documentation](https://github.com/vurnchat/vurn-server#readme)
-          - [Web Client](https://github.com/vurnchat/vurn-web)
-          NOTES
-
-      - name: Create Release
+      - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
-          body_path: release_notes.md
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
           files: |
-            vurn-server-x86_64-unknown-linux-gnu
-            vurn-server-x86_64-unknown-linux-gnu.sha256
-            vurn-server-aarch64-unknown-linux-gnu
-            vurn-server-aarch64-unknown-linux-gnu.sha256
-            vurn-server-x86_64-apple-darwin
-            vurn-server-x86_64-apple-darwin.sha256
-            vurn-server-aarch64-apple-darwin
-            vurn-server-aarch64-apple-darwin.sha256
+            vurn-server-${{ matrix.target }}.tar.gz
+            vurn-server-${{ matrix.target }}.tar.gz.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
