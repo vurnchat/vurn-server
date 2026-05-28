@@ -384,7 +384,7 @@ async fn load_tls_config(cert_path: &str, key_path: &str) -> Result<Arc<ServerCo
         .with_single_cert(certs, key)
         .map_err(|e| format!("TLS config build failed: {e}"))?;
 
-    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
 
     Ok(Arc::new(config))
 }
