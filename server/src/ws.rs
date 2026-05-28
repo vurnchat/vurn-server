@@ -73,6 +73,7 @@ impl TokenBucket {
 }
 
 /// Internal state of the WebSocket gateway.
+#[derive(Default)]
 pub struct GatewayStateInner {
     /// WS senders: user_hash → list of send channels
     pub clients: HashMap<Vec<u8>, Vec<mpsc::UnboundedSender<Vec<u8>>>>,
@@ -85,17 +86,6 @@ pub struct GatewayStateInner {
 }
 
 use std::collections::HashMap;
-
-impl Default for GatewayStateInner {
-    fn default() -> Self {
-        Self {
-            clients: HashMap::new(),
-            p2p_cmd_tx: None,
-            p2p_connected: false,
-            rate_limiters: HashMap::new(),
-        }
-    }
-}
 
 pub type SharedState = Arc<RwLock<GatewayStateInner>>;
 

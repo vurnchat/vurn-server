@@ -55,7 +55,7 @@ pub struct NodeBehaviour {
 pub enum NodeBehaviourEvent {
     Kademlia(kad::Event),
     Gossipsub(gossipsub::Event),
-    Identify(identify::Event),
+    Identify(Box<identify::Event>),
     Ping(libp2p::ping::Event),
     Relay(relay::Event),
     Dcutr(dcutr::Event),
@@ -68,7 +68,7 @@ impl From<gossipsub::Event> for NodeBehaviourEvent {
     fn from(e: gossipsub::Event) -> Self { NodeBehaviourEvent::Gossipsub(e) }
 }
 impl From<identify::Event> for NodeBehaviourEvent {
-    fn from(e: identify::Event) -> Self { NodeBehaviourEvent::Identify(e) }
+    fn from(e: identify::Event) -> Self { NodeBehaviourEvent::Identify(Box::new(e)) }
 }
 impl From<libp2p::ping::Event> for NodeBehaviourEvent {
     fn from(e: libp2p::ping::Event) -> Self { NodeBehaviourEvent::Ping(e) }
@@ -256,14 +256,11 @@ impl P2PNode {
             // overwhelming the libp2p dialer on startup.
             {
                 let mut persisted: Vec<Multiaddr> = Vec::new();
-                if let Some(peer_tree) = sled_db.open_tree(Self::SLED_PEER_TREE).ok() {
-                    for result in peer_tree.iter() {
-                        if let Ok((_key_bytes, val_bytes)) = result {
-                            if let Ok(addrs) = bincode::deserialize::<Vec<Multiaddr>>(&val_bytes) {
-                                // Take at most 1 addr per peer to keep dials manageable
-                                if let Some(addr) = addrs.first().cloned() {
-                                    persisted.push(addr);
-                                }
+                if let Ok(peer_tree) = sled_db.open_tree(Self::SLED_PEER_TREE) {
+                    for (_key_bytes, val_bytes) in peer_tree.iter().flatten() {
+                        if let Ok(addrs) = bincode::deserialize::<Vec<Multiaddr>>(&val_bytes) {
+                            if let Some(addr) = addrs.first().cloned() {
+                                persisted.push(addr);
                             }
                         }
                     }
@@ -403,7 +400,6 @@ fn generate_signing_key() -> SigningKey {
 // ── Event handling ─────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 async fn handle_swarm_event(
     event: SwarmEvent<NodeBehaviourEvent>,
     ev_tx: &mpsc::Sender<NodeEvent>,
@@ -426,7 +422,7 @@ async fn handle_swarm_event(
                 mailbox_state
             }
             NodeBehaviourEvent::Identify(identify_event) => {
-                handle_identify_event(identify_event, ev_tx).await;
+                handle_identify_event(*identify_event, ev_tx).await;
                 mailbox_state
             }
             NodeBehaviourEvent::Ping(ping_event) => {
@@ -457,7 +453,7 @@ async fn handle_swarm_event(
             // Store the remote address for re-dial and persist to Sled
             let addr = endpoint.get_remote_address();
             peer_addrs.entry(peer_id).or_default().push(addr.clone());
-            persist_peer_addr(&sled_db, &peer_id, &addr);
+            persist_peer_addr(sled_db, &peer_id, addr);
             let _ = ev_tx.send(NodeEvent::PeerDiscovered(peer_id)).await;
             mailbox_state
         }
@@ -479,7 +475,6 @@ async fn handle_swarm_event(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 async fn handle_kad_event(
     event: kad::Event,
@@ -576,6 +571,7 @@ async fn handle_kad_event(
 }
 
 /// Handle a FoundRecord response — process according to current state.
+#[allow(clippy::too_many_arguments)]
 async fn handle_found_record(
     key: Vec<u8>,
     value: Option<Vec<u8>>,
@@ -729,11 +725,11 @@ async fn resume_pending_command(
             if index == 0 {
                 info!("MailboxRetrieve (lazy): index=0 for {}",
                     hex_fmt(user_hash, 8));
-                return emit_empty_mailbox(user_hash.clone(), ev_tx).await;
+                emit_empty_mailbox(user_hash.clone(), ev_tx).await
             } else {
                 info!("MailboxRetrieve (lazy): index={index}, fetching {index} msgs for {}",
                     hex_fmt(user_hash, 8));
-                return start_collecting_messages(kademlia, user_hash.clone(), index);
+                start_collecting_messages(kademlia, user_hash.clone(), index)
             }
         }
     }
@@ -817,6 +813,7 @@ async fn emit_empty_mailbox(
 
 /// Collect a message from DHT, verify its envelope, and continue or emit.
 /// The `deadline` is preserved from the parent `CollectingMessages` state.
+#[allow(clippy::too_many_arguments)]
 async fn collect_message(
     user_hash: Vec<u8>,
     mut remaining: Vec<u64>,
@@ -879,22 +876,21 @@ async fn collect_message(
 
 // ── Identify ────────────────────────────────────────────────────────
 
+#[allow(clippy::single_match)]
 async fn handle_identify_event(
     event: identify::Event,
     ev_tx: &mpsc::Sender<NodeEvent>,
 ) {
-    match event {
-        identify::Event::Received { peer_id, info, .. } => {
-            info!("Identify received from {peer_id}: agent={}, protocols={:?}",
-                info.agent_version, info.protocols);
-            let _ = ev_tx.send(NodeEvent::PeerDiscovered(peer_id)).await;
-        }
-        _ => {}
+    if let identify::Event::Received { peer_id, info, .. } = event {
+        info!("Identify received from {peer_id}: agent={}, protocols={:?}",
+            info.agent_version, info.protocols);
+        let _ = ev_tx.send(NodeEvent::PeerDiscovered(peer_id)).await;
     }
 }
 
 // ── GossipSub ───────────────────────────────────────────────────────
 
+#[allow(clippy::let_underscore_future)]
 fn handle_gossipsub_event(
     event: gossipsub::Event,
     ev_tx: &mpsc::Sender<NodeEvent>,
@@ -906,7 +902,7 @@ fn handle_gossipsub_event(
     } = event
     {
         let topic = message.topic.as_str().as_bytes().to_vec();
-        let _ = ev_tx.send(NodeEvent::MessageReceived {
+        let _ = ev_tx.try_send(NodeEvent::MessageReceived {
             from: propagation_source,
             topic,
             data: message.data,
@@ -916,7 +912,6 @@ fn handle_gossipsub_event(
 
 // ── Command handling ────────────────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 async fn handle_command(
     swarm: &mut libp2p::Swarm<NodeBehaviour>,
@@ -1075,6 +1070,7 @@ fn fire_window(
 /// 2. All seqs in window are found → advance to the next window.
 ///
 /// Returns `Idle` (after `resume_pending_command`) or the next `FetchingIndex`.
+#[allow(clippy::too_many_arguments)]
 async fn try_resolve_window(
     pending_command: PendingNodeCommand,
     window_start: u64,
