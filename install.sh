@@ -1,4 +1,3 @@
-bash
 #!/bin/bash
 # ── VurnChat P2P Node — Production Installer ────────────────────────
 #
@@ -483,11 +482,10 @@ EnvironmentFile=-${CONFIG_DIR}/vurn.env
 Environment=RUST_LOG=\${VURN_LOG:-info}
 
 ExecStart=${INSTALL_PATH} \\
-    --port \${VURN_PORT:-9000} \\
-    --listen-p2p \${VURN_P2P_LISTEN:-/ip4/0.0.0.0/tcp/0} \\
-    ${BOOTSTRAP_CMDLINE} \\
-    \${VURN_CERT:+--cert \$VURN_CERT} \\
-    \${VURN_KEY:+--key \$VURN_KEY}
+    --port \$VURN_PORT \\
+    --listen-p2p /ip4/0.0.0.0/tcp/0 \\
+    --cert \$VURN_CERT \\
+    --key \$VURN_KEY
 
 Restart=always
 RestartSec=5
