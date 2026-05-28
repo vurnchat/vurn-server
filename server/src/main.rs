@@ -13,7 +13,8 @@
 //! ```
 
 use rustls::{pki_types::PrivateKeyDer, ServerConfig};
-use std::{fs::File, io::BufReader, sync::Arc};
+use std::sync::Arc;
+use std::{fs::File, io::BufReader};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{error, info, trace, warn};
 
@@ -378,10 +379,12 @@ async fn load_tls_config(cert_path: &str, key_path: &str) -> Result<Arc<ServerCo
     .await
     .map_err(|e| format!("Task join failed: {e}"))??;
 
-    let config = ServerConfig::builder()
+    let mut config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .map_err(|e| format!("TLS config build failed: {e}"))?;
+
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     Ok(Arc::new(config))
 }
