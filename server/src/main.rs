@@ -214,7 +214,7 @@ async fn main() {
     });
 
     // ── 5. Start WS/WSS gateway ──
-    let ws_addr = format!("127.0.0.1:{}", args.ws_port);
+    let ws_addr = format!("0.0.0.0:{}", args.ws_port);
     let app = crate::ws::build_gateway_router().with_state(ws_state.clone());
 
     match args.mode {
