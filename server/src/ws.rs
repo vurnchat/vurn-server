@@ -17,6 +17,8 @@ use axum::{
 };
 use futures_util::{sink::SinkExt, stream::StreamExt};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{error, info, trace, warn};
 
@@ -208,6 +210,27 @@ async fn handle_ws_connection(socket: WebSocket, gateway_state: SharedState) {
         }
     });
 
+    // Step 3.5: Spawn periodic mailbox poll (every 30s) — catches messages that GossipSub missed
+    let poll_cancel = Arc::new(AtomicBool::new(false));
+    let poll_cancel_ref = poll_cancel.clone();
+    let sid_poll = session_id.clone();
+    let state_poll = gateway_state.clone();
+    let poll_task = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            if poll_cancel_ref.load(Ordering::Relaxed) {
+                break;
+            }
+            let map = state_poll.read().await;
+            if let Some(ref cmd_tx) = map.p2p_cmd_tx {
+                let cmd = NodeCommand::MailboxRetrieve {
+                    user_hash: sid_poll.to_vec(),
+                };
+                let _ = cmd_tx.send(cmd).await;
+            }
+        }
+    });
+
     // Step 4: Read messages from client
     while let Some(msg) = ws_stream.next().await {
         match msg {
@@ -230,6 +253,9 @@ async fn handle_ws_connection(socket: WebSocket, gateway_state: SharedState) {
 
     // Step 5: Cleanup
     info!("Client disconnected: {}", hex_fmt(&session_id, 8));
+    // Cancel periodic mailbox poll
+    poll_cancel.store(true, Ordering::Relaxed);
+    poll_task.abort();
     {
         let mut map = gateway_state.write().await;
         // Remove rate limiters for this client
@@ -306,20 +332,21 @@ async fn relay_or_p2p(state: &SharedState, sender_id: &[u8], data: &[u8]) {
 
     if delivered {
         info!("Local relay: {} → {}", hex_fmt(sender_id, 8), hex_fmt(recipient_id, 8));
-        return;
-    }
-
-    // Try GossipSub realtime delivery (for recipients on other nodes)
-    {
-        let map = state.read().await;
-        if let Some(ref cmd_tx) = map.p2p_cmd_tx {
-            let topic = hex::encode(recipient_id);
-            let cmd = NodeCommand::Publish {
-                topic: topic.clone(),
-                data: forward.clone(),
-            };
-            let _ = cmd_tx.send(cmd).await;
-            trace!("GossipSub publish to topic {} for {}", topic, hex_fmt(recipient_id, 8));
+        // Recipient is on this node — skip GossipSub to avoid duplicates.
+        // Still store in mailbox for offline durability.
+    } else {
+        // Try GossipSub realtime delivery (for recipients on other nodes)
+        {
+            let map = state.read().await;
+            if let Some(ref cmd_tx) = map.p2p_cmd_tx {
+                let topic = hex::encode(recipient_id);
+                let cmd = NodeCommand::Publish {
+                    topic: topic.clone(),
+                    data: forward.clone(),
+                };
+                let _ = cmd_tx.send(cmd).await;
+                trace!("GossipSub publish to topic {} for {}", topic, hex_fmt(recipient_id, 8));
+            }
         }
     }
 

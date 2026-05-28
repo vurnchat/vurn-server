@@ -4,9 +4,10 @@
 //! in a Sled embedded database for durability.
 
 use crate::p2p::dht;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{info, trace, warn};
 
 /// Prefix for Sled-tree namespacing.
 /// Made `pub` so that P2P node (get_sled_max_seq) uses the same constant.
@@ -33,6 +34,9 @@ impl MailboxManager {
     /// Each message is expected to be a serialized `DhtEnvelope`. We deserialize
     /// to extract the seq (for Sled dedup key) and the payload (for WS delivery).
     /// Legacy (non-envelope) messages fall back to timestamp-based keys.
+    ///
+    /// Dedup: if a seq-key already exists in Sled (from a previous retrieval),
+    /// the message is skipped — it was already delivered to the client.
     pub async fn handle_retrieval_result(
         &self,
         user_hash: &[u8],
@@ -45,13 +49,23 @@ impl MailboxManager {
         }
 
         let mut payloads = Vec::with_capacity(messages.len());
+        // Track seqs already stored in this batch to avoid intra-batch duplicates
+        let mut batch_seqs: HashSet<u64> = HashSet::new();
 
         for msg in messages {
             match dht::deserialize_envelope(msg) {
                 Ok(envelope) => {
+                    let seq = envelope.seq;
+                    // Dedup: skip if already delivered (Sled) or already in this batch
+                    if batch_seqs.contains(&seq) || self.is_seq_already_stored(user_hash, seq) {
+                        trace!("Mailbox: skipping already-delivered seq {seq} for {}",
+                            hex_fmt(user_hash, 8));
+                        continue;
+                    }
+                    batch_seqs.insert(seq);
                     // Seq-based key = dedup within user_hash
-                    if let Err(e) = self.write_sled_raw_seq(user_hash, envelope.seq, msg) {
-                        warn!("Sled backup write failed for seq {}: {e}", envelope.seq);
+                    if let Err(e) = self.write_sled_raw_seq(user_hash, seq, msg) {
+                        warn!("Sled backup write failed for seq {}: {e}", seq);
                     }
                     payloads.push(envelope.payload.clone());
                 }
@@ -72,6 +86,16 @@ impl MailboxManager {
         );
 
         payloads
+    }
+
+    /// Check if a seq-based key already exists in Sled (message was already delivered).
+    fn is_seq_already_stored(&self, user_hash: &[u8], seq: u64) -> bool {
+        let tree = match self.db.open_tree(SLED_MAILBOX_TREE) {
+            Ok(t) => t,
+            Err(_) => return false,
+        };
+        let key = [user_hash, &seq.to_be_bytes()].concat();
+        tree.contains_key(key).unwrap_or(false)
     }
 
     /// Read all stored messages from local Sled backup, then clear them.
