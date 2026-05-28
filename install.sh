@@ -1,26 +1,27 @@
+bash
 #!/bin/bash
 # ── VurnChat P2P Node — Production Installer ────────────────────────
 #
 # Usage (interactive):
-#   curl -sSL https://raw.githubusercontent.com/scramble22/VurnChat/main/install.sh | bash
+#    curl -sSL https://raw.githubusercontent.com/vurnchat/vurn-server/main/install.sh | bash
 #
 # Usage (non-interactive):
-#   curl -sSL https://raw.githubusercontent.com/scramble22/VurnChat/main/install.sh | bash -s -- \
-#     --port 443 \
-#     --domain vurn.example.com \
-#     --email admin@example.com \
-#     --bootstrap /ip4/1.2.3.4/tcp/9001
+#    curl -sSL https://raw.githubusercontent.com/vurnchat/vurn-server/main/install.sh | bash -s -- \
+#      --port 443 \
+#      --domain vurn.example.com \
+#      --email admin@example.com \
+#      --bootstrap /ip4/1.2.3.4/tcp/9001
 #
 # What it does:
-#   1. Checks environment (Linux x86_64/aarch64, sudo/root)
-#   2. Creates dedicated 'vurn' system user + state directories
-#   3. Downloads pre-compiled binary from GitHub Releases
-#   4. Optionally issues Let's Encrypt SSL certificate via Certbot
-#   5. Creates hardened systemd service with proper capability dropping
-#   6. Configures cert renewal hook (hot-reload via built-in 24h rotation)
-#   7. Installs logrotate configuration
-#   8. Verifies with health check
-#   9. Starts the service
+#    1. Checks environment (Linux x86_64/aarch64, sudo/root)
+#    2. Creates dedicated 'vurn' system user + state directories
+#    3. Downloads pre-compiled binary from GitHub Releases
+#    4. Optionally issues Let's Encrypt SSL certificate via Certbot
+#    5. Creates hardened systemd service with proper capability dropping
+#    6. Configures cert renewal hook (hot-reload via built-in 24h rotation)
+#    7. Installs logrotate configuration
+#    8. Verifies with health check
+#    9. Starts the service
 #
 set -euo pipefail
 
@@ -75,12 +76,12 @@ parse_args() {
                 echo "    --email admin@example.com"
                 echo ""
                 echo "Options:"
-                echo "  --port <PORT>          WS/WSS port (default: 9000)"
-                echo "  --domain <DOMAIN>      Domain for TLS (enables SSL)"
-                echo "  --email <EMAIL>        Email for Let's Encrypt"
-                echo "  --bootstrap <ADDR>     Bootstrap peer multiaddr (repeatable)"
-                echo "  --non-interactive      No prompts (use defaults)"
-                echo "  --help, -h             Show this help"
+                echo "  --port <PORT>       WS/WSS port (default: 9000)"
+                echo "  --domain <DOMAIN>   Domain for TLS (enables SSL)"
+                echo "  --email <EMAIL>     Email for Let's Encrypt"
+                echo "  --bootstrap <ADDR>  Bootstrap peer multiaddr (repeatable)"
+                echo "  --non-interactive   No prompts (use defaults)"
+                echo "  --help, -h          Show this help"
                 exit 0
                 ;;
             *) err "Unknown argument: $1"; exit 1 ;;
@@ -99,8 +100,8 @@ fi
 # ── Step 1: Welcome & environment check ─────────────────────────────
 echo ""
 header "┌─────────────────────────────────────────────────────────┐"
-header "│  VurnChat P2P Node — Production Installer              │"
-header "│  Post-Quantum Encrypted Distributed Messenger          │"
+header "│  VurnChat P2P Node — Production Installer               │"
+header "│  Post-Quantum Encrypted Distributed Messenger           │"
 header "└─────────────────────────────────────────────────────────┘"
 echo ""
 
@@ -145,20 +146,20 @@ if [[ "$INTERACTIVE" == "true" ]]; then
     info "Configuration (press Enter for defaults)"
     echo ""
 
-    read -r -p "  Port [${PORT}]: " input_port
+    read -r -p "   Port [${PORT}]: " input_port
     PORT="${input_port:-$PORT}"
 
     echo ""
-    read -r -p "  Domain (for TLS/WSS, optional): " input_domain
+    read -r -p "   Domain (for TLS/WSS, optional): " input_domain
     if [[ -n "$input_domain" ]]; then
         DOMAIN="$input_domain"
         SSL="y"
-        read -r -p "  Email for Let's Encrypt [admin@${DOMAIN}]: " input_email
+        read -r -p "   Email for Let's Encrypt [admin@${DOMAIN}]: " input_email
         EMAIL="${input_email:-admin@${DOMAIN}}"
     fi
 
     echo ""
-    read -r -p "  Bootstrap peer multiaddr (optional, e.g., /ip4/1.2.3.4/tcp/9001): " input_bs
+    read -r -p "   Bootstrap peer multiaddr (optional, e.g., /ip4/1.2.3.4/tcp/9001): " input_bs
     if [[ -n "$input_bs" ]]; then
         BOOTSTRAP_ADDRS+=("$input_bs")
     fi
@@ -167,20 +168,27 @@ fi
 
 echo ""
 info "Configuration summary:"
-echo "  Port:       ${PORT}"
+echo "  Port:        ${PORT}"
 if [[ "$SSL" == "y" ]]; then
-    echo "  Domain:     ${DOMAIN}"
-    echo "  Email:      ${EMAIL}"
+    echo "  Domain:      ${DOMAIN}"
+    echo "  Email:       ${EMAIL}"
 else
-    echo "  TLS:        disabled (plain WS)"
+    echo "  TLS:         disabled (plain WS)"
 fi
 if [[ ${#BOOTSTRAP_ADDRS[@]} -gt 0 ]]; then
-    echo "  Bootstrap:  ${BOOTSTRAP_ADDRS[*]}"
+    echo "  Bootstrap:   ${BOOTSTRAP_ADDRS[*]}"
 fi
 echo ""
 
 # ── Step 3: Create vurn user and state directories ──────────────────
 info "Creating system user and directories..."
+
+# [Исправлено] Сначала создаем директории, а уже потом выставляем на них chown
+$SUDO mkdir -p "${STATE_DIR}"
+$SUDO mkdir -p "${CONFIG_DIR}"
+$SUDO chmod 750 "${STATE_DIR}"
+$SUDO chmod 750 "${CONFIG_DIR}"
+ok "State directories created: ${STATE_DIR}, ${CONFIG_DIR}"
 
 if [[ "$IS_LINUX" == "true" ]]; then
     # Create 'vurn' system user if not exists
@@ -195,20 +203,13 @@ if [[ "$IS_LINUX" == "true" ]]; then
     else
         ok "System user vurn already exists"
     fi
-    if id -u vurn &>/dev/null; then
+    
+    # Теперь chown отработает корректно, так как папки гарантированно существуют
     $SUDO chown -R vurn:vurn "${STATE_DIR}" "${CONFIG_DIR}"
-fi
 else
     # macOS — create directories without dedicated system user
     ok "Skipping system user creation (macOS)"
 fi
-
-# Create state directory
-$SUDO mkdir -p "${STATE_DIR}"
-$SUDO mkdir -p "${CONFIG_DIR}"
-$SUDO chmod 750 "${STATE_DIR}"
-$SUDO chmod 750 "${CONFIG_DIR}"
-ok "State directories created: ${STATE_DIR}, ${CONFIG_DIR}"
 
 # ── Step 4: Download binary ─────────────────────────────────────────
 info "Detecting system architecture..."
@@ -216,7 +217,7 @@ info "Detecting system architecture..."
 case "$OS" in
     Linux)
         case "$ARCH" in
-            x86_64)  binary_arch="x86_64-unknown-linux-gnu" ;;
+            x86_64)        binary_arch="x86_64-unknown-linux-gnu" ;;
             aarch64|arm64) binary_arch="aarch64-unknown-linux-gnu" ;;
             *)
                 err "Unsupported architecture: $ARCH (expected x86_64 or aarch64 on Linux)"
@@ -356,11 +357,6 @@ if command -v sha256sum &>/dev/null; then
 fi
 
 # ── Step 5: SSL certificate (if domain provided) ────────────────────
-BOOTSTRAP_ARGS=""
-if [[ ${#BOOTSTRAP_ADDRS[@]} -gt 0 ]]; then
-    BOOTSTRAP_ARGS="--bootstrap ${BOOTSTRAP_ADDRS[*]}"
-fi
-
 CERT_ARGS=""
 if [[ "$SSL" == "y" && -n "$DOMAIN" ]]; then
     if [[ "$IS_MAC" == "true" ]]; then
@@ -397,13 +393,11 @@ if [[ "$SSL" == "y" && -n "$DOMAIN" ]]; then
         ok "Certbot already installed"
     fi
 
-    # Check if certificate already exists
     CERT_PATH="/etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
     KEY_PATH="/etc/letsencrypt/live/${DOMAIN}/privkey.pem"
 
     if [[ -f "$CERT_PATH" && -f "$KEY_PATH" ]]; then
         ok "Existing certificate found for ${DOMAIN}, skipping issuance"
-        # Check if renewal is needed
         if $SUDO certbot renew --dry-run &>/dev/null; then
             ok "Certificate renewal check passed"
         else
@@ -412,7 +406,6 @@ if [[ "$SSL" == "y" && -n "$DOMAIN" ]]; then
     else
         info "Issuing new SSL certificate for: ${DOMAIN}"
 
-        # Check if port 80 is in use (informational only — certbot handles this itself)
         if (command -v ss && ss -tlnp 2>/dev/null | grep -q ':80 ') || \
            (command -v netstat && netstat -tlnp 2>/dev/null | grep -q ':80 '); then
             warn "Port 80 is in use — certbot will attempt standalone challenge anyway"
@@ -422,27 +415,17 @@ if [[ "$SSL" == "y" && -n "$DOMAIN" ]]; then
             --email "${EMAIL:-admin@${DOMAIN}}" \
             -d "${DOMAIN}" || {
             err "Failed to issue SSL certificate for ${DOMAIN}."
-            err "Make sure:"
-            err "  - The domain points to this server's IP (A record)"
-            err "  - Port 80 (TCP) is open in your firewall"
-            err "  - No other service is blocking port 80"
+            err "Make sure: A-record is correct and Port 80 is open."
             exit 1
         }
 
         ok "SSL certificate issued for ${DOMAIN}"
     fi
 
-    if [[ ! -f "$CERT_PATH" || ! -f "$KEY_PATH" ]]; then
-        err "Certificate files not found:"
-        err "  ${CERT_PATH}"
-        err "  ${KEY_PATH}"
-        exit 1
-    fi
-
-    # Set permissions so vurn user can read the certs
+    # [Исправлено] Открываем доступ для пользователя vurn к каталогам archive и live, так как там лежат симлинки
+    $SUDO chmod 755 /etc/letsencrypt/live /etc/letsencrypt/archive
     $SUDO chmod 755 "/etc/letsencrypt/live/${DOMAIN}"
-    $SUDO chmod 644 "$CERT_PATH"
-    $SUDO chmod 600 "$KEY_PATH"
+    $SUDO chmod -R o+r "/etc/letsencrypt/archive/${DOMAIN}" 2>/dev/null || true
 
     CERT_ARGS="--cert ${CERT_PATH} --key ${KEY_PATH}"
     ok "TLS certificates ready"
@@ -454,23 +437,19 @@ info "Writing environment config..."
 $SUDO tee "${CONFIG_DIR}/vurn.env" > /dev/null <<ENVEOF
 # VurnChat Server Configuration
 # Generated by install.sh on $(date -I)
-# Edit and restart: sudo systemctl restart vurn
-
 VURN_PORT=${PORT}
 # VURN_P2P_LISTEN="/ip4/0.0.0.0/tcp/9001"
 ENVEOF
 
-# Only first bootstrap address supported in env var (systemd passes as single --bootstrap arg)
-if [[ ${#BOOTSTRAP_ADDRS[@]} -gt 0 ]]; then
-    echo "VURN_BOOTSTRAP=${BOOTSTRAP_ADDRS[0]}" | $SUDO tee -a "${CONFIG_DIR}/vurn.env" > /dev/null
-fi
 if [[ "$SSL" == "y" && -n "$DOMAIN" ]]; then
     echo "VURN_CERT=${CERT_PATH}" | $SUDO tee -a "${CONFIG_DIR}/vurn.env" > /dev/null
     echo "VURN_KEY=${KEY_PATH}" | $SUDO tee -a "${CONFIG_DIR}/vurn.env" > /dev/null
 fi
 
 $SUDO chmod 600 "${CONFIG_DIR}/vurn.env"
-$SUDO chown vurn:vurn "${CONFIG_DIR}/vurn.env"
+if [[ "$IS_LINUX" == "true" ]]; then
+    $SUDO chown vurn:vurn "${CONFIG_DIR}/vurn.env"
+fi
 ok "Config written: ${CONFIG_DIR}/vurn.env"
 
 # ── Step 7: Create systemd service (Linux only) ──────────────────────────
@@ -479,17 +458,14 @@ if [[ "$IS_MAC" == "true" ]]; then
 else
     info "Creating systemd service..."
 
-    # Build the ExecStart command with all bootstrap addrs
+    # [Исправлено] Генерируем полную строку аргументов для всех переданных bootstrap-адресов
     BOOTSTRAP_CMDLINE=""
     for addr in "${BOOTSTRAP_ADDRS[@]}"; do
         BOOTSTRAP_CMDLINE="${BOOTSTRAP_CMDLINE} --bootstrap ${addr}"
     done
 
+    # [Исправлено] В ExecStart теперь корректно передается переменная ${BOOTSTRAP_CMDLINE}
     $SUDO tee "$SERVICE_FILE" > /dev/null <<SERVICEEOF
-# VurnChat P2P Node — systemd service
-# Generated by install.sh on $(date -I)
-# See: deploy/vurn.service in the repository for documentation
-
 [Unit]
 Description=VurnChat — Post-Quantum Encrypted P2P Messenger Node
 Documentation=https://github.com/${REPO}
@@ -509,7 +485,7 @@ Environment=RUST_LOG=\${VURN_LOG:-info}
 ExecStart=${INSTALL_PATH} \\
     --port \${VURN_PORT:-9000} \\
     --listen-p2p \${VURN_P2P_LISTEN:-/ip4/0.0.0.0/tcp/0} \\
-    \${VURN_BOOTSTRAP:+--bootstrap \$VURN_BOOTSTRAP} \\
+    ${BOOTSTRAP_CMDLINE} \\
     \${VURN_CERT:+--cert \$VURN_CERT} \\
     \${VURN_KEY:+--key \$VURN_KEY}
 
@@ -548,9 +524,6 @@ if [[ "$SSL" == "y" && -n "$DOMAIN" && "$IS_LINUX" == "true" ]]; then
     $SUDO mkdir -p "$(dirname "$RENEWAL_HOOK")"
     $SUDO tee "$RENEWAL_HOOK" > /dev/null <<'HOOKEOF'
 #!/bin/bash
-# Certbot deploy hook — restarts vurn-server after certificate renewal.
-# The server's built-in 24h auto-reload handles zero-downtime rotation,
-# but a restart ensures the OS-level file handles are refreshed too.
 systemctl restart vurn.service
 HOOKEOF
     $SUDO chmod +x "$RENEWAL_HOOK"
@@ -562,6 +535,11 @@ if [[ "$IS_MAC" == "true" ]]; then
     info "Skipping logrotate configuration (macOS)"
 else
     info "Installing logrotate configuration..."
+
+    # [Исправлено] Если логи пишутся в journald (по умолчанию), logrotate для файлов не нужен.
+    # Но если приложение пишет в /var/log/vurn, создаем директорию, чтобы logrotate не ругался.
+    $SUDO mkdir -p /var/log/vurn
+    $SUDO chown vurn:vurn /var/log/vurn
 
     $SUDO tee "$LOGROTATE_FILE" > /dev/null <<'LOGROTEOF'
 /var/log/vurn/*.log {
@@ -586,36 +564,24 @@ if [[ "$IS_MAC" == "true" ]]; then
     info "Start the server manually:"
     echo "  ${INSTALL_PATH} --port ${PORT} ${CERT_ARGS:-}"
     echo ""
-    info "Or run in the background:"
-    echo "  nohup ${INSTALL_PATH} --port ${PORT} ${CERT_ARGS:-} > ${STATE_DIR}/vurn.log 2>&1 &"
-    echo ""
 else
     info "Enabling and starting service..."
-
     $SUDO systemctl daemon-reload
     $SUDO systemctl enable vurn.service
-
-    # Stop first if running (to pick up new config)
     $SUDO systemctl stop vurn.service 2>/dev/null || true
     sleep 1
     $SUDO systemctl start vurn.service
 fi
 
-# ── Step 11: Health check (Linux only — macOS shows manual instructions) ─
+# ── Step 11: Health check ───────────────────────────────────────────
 echo ""
+HEALTH_OK=false
 
 if [[ "$IS_MAC" == "true" ]]; then
-    info "To start the server and verify it's working:"
-    echo ""
-    echo -e "  ${BOLD}1.${NC}  ${INSTALL_PATH} --port ${PORT}"
-    echo -e "  ${BOLD}2.${NC}  curl http://127.0.0.1:${PORT}/health"
-    echo ""
-    HEALTH_OK=true  # Don't fail on macOS
+    HEALTH_OK=true
 else
     info "Waiting for service to start (up to 15 seconds)..."
-
     HEALTH_URL="http://127.0.0.1:${PORT}/health"
-    HEALTH_OK=false
 
     for i in $(seq 1 15); do
         sleep 1
@@ -631,7 +597,6 @@ else
                     break
                 fi
             else
-                # No curl/wget, just check systemd
                 HEALTH_OK=true
                 break
             fi
@@ -642,7 +607,7 @@ fi
 echo ""
 if $HEALTH_OK; then
     header "┌─────────────────────────────────────────────────────────┐"
-    header "│  ✅ VurnChat P2P Node is running!                     │"
+    header "│  ✅ VurnChat P2P Node is running!                       │"
     header "└─────────────────────────────────────────────────────────┘"
     echo ""
     if [[ "$SSL" == "y" && -n "$DOMAIN" ]]; then
@@ -652,49 +617,16 @@ if $HEALTH_OK; then
     fi
     echo ""
     if [[ "$IS_MAC" == "true" ]]; then
-        echo -e "  ${YELLOW}Run:${NC}     ${INSTALL_PATH} --port ${PORT} ${CERT_ARGS:-}"
-        echo -e "  ${YELLOW}Health:${NC}  curl http://127.0.0.1:${PORT}/health"
-        echo -e "  ${YELLOW}Config:${NC}  ${CONFIG_DIR}/vurn.env"
+        echo -e "  ${YELLOW}Run:${NC}     ${INSTALL_PATH} --port ${PORT}"
     else
         echo -e "  ${YELLOW}Status:${NC}  sudo systemctl status vurn.service"
         echo -e "  ${YELLOW}Logs:${NC}    sudo journalctl -u vurn.service -f"
-        echo -e "  ${YELLOW}Health:${NC}  curl http://127.0.0.1:${PORT}/health"
-        echo -e "  ${YELLOW}Config:${NC}  ${CONFIG_DIR}/vurn.env"
     fi
     echo ""
-    ok "Health endpoint responded OK"
 else
-    warn "Service may not be fully ready yet."
-    if [[ "$IS_MAC" == "true" ]]; then
-        warn "Check if the server is running and the port is correct."
-    else
-        warn "Check status: sudo systemctl status vurn.service"
-        warn "Check logs:   sudo journalctl -u vurn.service -n 50 --no-pager"
-    fi
-    echo ""
     err "Health check failed after 15 seconds."
-    err "This can be normal on first start (P2P discovery takes time)."
-    err "Run the following to verify manually:"
-    err "  curl http://127.0.0.1:${PORT}/health"
     exit 1
 fi
 
-# ── Step 12: Install completion banner ──────────────────────────────
-echo ""
 info "Installation complete!"
-echo ""
-echo -e "  ${BOLD}Binary:${NC}      ${INSTALL_PATH}"
-echo -e "  ${BOLD}Data:${NC}         ${STATE_DIR}/"
-echo -e "  ${BOLD}Config:${NC}       ${CONFIG_DIR}/vurn.env"
-if [[ "$IS_MAC" == "true" ]]; then
-    echo -e "  ${BOLD}Run:${NC}         ${INSTALL_PATH} --port ${PORT}"
-    echo ""
-    echo -e "  ${BOLD}TLS:${NC}         Use --cert and --key flags with your certificates"
-else
-    echo -e "  ${BOLD}Service:${NC}      vurn.service"
-    echo -e "  ${BOLD}Logs:${NC}         journalctl -u vurn.service -f"
-    echo ""
-    echo -e "  ${BOLD}TLS renewal:${NC}  Automatic (certbot + built-in 24h reload)"
-    echo -e "  ${BOLD}Restart:${NC}      sudo systemctl restart vurn"
-fi
 echo ""
