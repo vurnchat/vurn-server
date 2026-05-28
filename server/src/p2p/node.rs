@@ -540,17 +540,34 @@ async fn handle_kad_event(
                         }
                         MailboxState::FetchingIndex { ref pending_command, .. } => {
                             let hash = pending_command.user_hash().to_vec();
-                            info!("DHT get_record failed during FetchingIndex for {}, emitting empty result",
+                            info!("DHT get_record failed during FetchingIndex for {}, resuming pending command with index=0",
+                                hex_fmt(&hash, 8));
+                            // Clone pending_command before modifying state (borrow avoidance)
+                            let cmd = pending_command.clone();
+                            // Resume the pending command with index=0 (no DHT data found)
+                            // For MailboxStore: this saves the first message (seq=1) to Sled backup
+                            // For MailboxRetrieve: this emits empty result, triggers Sled backup check
+                            mailbox_indices.insert(hash.clone(), 0);
+                            let _ = resume_pending_command(
+                                &cmd, 0, ev_tx, swarm,
+                                mailbox_indices, signing_key, sled_db,
+                            ).await;
+                        }
+                        MailboxState::Idle => {
+                            // Extract user_hash from the failed DHT key for Sled fallback
+                            let failed_key = match &e {
+                                kad::GetRecordError::NotFound { key, .. } => Some(key.to_vec()),
+                                _ => None,
+                            };
+                            let hash = failed_key
+                                .as_deref()
+                                .and_then(dht::parse_user_hash_from_key)
+                                .map(|h| h.to_vec())
+                                .unwrap_or_default();
+                            info!("DHT get_record failed while Idle for {}, emitting empty result",
                                 hex_fmt(&hash, 8));
                             let _ = ev_tx.send(NodeEvent::MailboxRetrieved {
                                 user_hash: hash,
-                                messages: Vec::new(),
-                            }).await;
-                        }
-                        MailboxState::Idle => {
-                            info!("DHT get_record failed while Idle, emitting empty result");
-                            let _ = ev_tx.send(NodeEvent::MailboxRetrieved {
-                                user_hash: Vec::new(),
                                 messages: Vec::new(),
                             }).await;
                         }
