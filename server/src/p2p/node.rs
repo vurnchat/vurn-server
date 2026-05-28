@@ -373,7 +373,7 @@ impl P2PNode {
                         mailbox_state = handle_command(
                             &mut swarm, cmd, &ev_tx, mailbox_state,
                             &mut mailbox_indices, &signing_key,
-                            &mut pending_profile_queries,
+                            &mut pending_profile_queries, &sled_db,
                         ).await;
                         mailbox_state = check_state_timeout(mailbox_state, &ev_tx);
                     }
@@ -415,7 +415,7 @@ async fn handle_swarm_event(
     match event {
         SwarmEvent::Behaviour(be) => match be {
             NodeBehaviourEvent::Kademlia(kad_event) => {
-                handle_kad_event(kad_event, ev_tx, swarm, mailbox_state, mailbox_indices, signing_key, pending_profile_queries).await
+                handle_kad_event(kad_event, ev_tx, swarm, mailbox_state, mailbox_indices, signing_key, pending_profile_queries, sled_db).await
             }
             NodeBehaviourEvent::Gossipsub(gs_event) => {
                 handle_gossipsub_event(gs_event, ev_tx);
@@ -484,6 +484,7 @@ async fn handle_kad_event(
     mailbox_indices: &mut HashMap<Vec<u8>, u64>,
     signing_key: &SigningKey,
     pending_profile_queries: &mut HashMap<kad::QueryId, oneshot::Sender<Option<Vec<u8>>>>,
+    sled_db: &sled::Db,
 ) -> MailboxState {
     match event {
         kad::Event::OutboundQueryProgressed { id, result, .. } => {
@@ -502,7 +503,7 @@ async fn handle_kad_event(
                             return state;
                         }
 
-                        state = handle_found_record(key, value, id, ev_tx, swarm, state, mailbox_indices, signing_key).await;
+                        state = handle_found_record(key, value, id, ev_tx, swarm, state, mailbox_indices, signing_key, sled_db).await;
                     }
                     kad::GetRecordOk::FinishedWithNoAdditionalRecord { .. } => {
                         // Check for pending profile lookup (query not matched by key prefix)
@@ -511,7 +512,7 @@ async fn handle_kad_event(
                             return state;
                         }
                         // A seq key not found — match by query id
-                        state = handle_not_found(id, ev_tx, swarm, state, mailbox_indices, signing_key).await;
+                        state = handle_not_found(id, ev_tx, swarm, state, mailbox_indices, signing_key, sled_db).await;
                     }
                 },
                 QueryResult::GetRecord(Err(e)) => {
@@ -529,10 +530,12 @@ async fn handle_kad_event(
                                 messages,
                             }).await;
                         }
-                        MailboxState::FetchingIndex { .. } => {
-                            info!("DHT get_record failed during FetchingIndex, emitting empty result");
+                        MailboxState::FetchingIndex { ref pending_command, .. } => {
+                            let hash = pending_command.user_hash().to_vec();
+                            info!("DHT get_record failed during FetchingIndex for {}, emitting empty result",
+                                hex_fmt(&hash, 8));
                             let _ = ev_tx.send(NodeEvent::MailboxRetrieved {
-                                user_hash: Vec::new(),
+                                user_hash: hash,
                                 messages: Vec::new(),
                             }).await;
                         }
@@ -581,6 +584,7 @@ async fn handle_found_record(
     state: MailboxState,
     mailbox_indices: &mut HashMap<Vec<u8>, u64>,
     signing_key: &SigningKey,
+    sled_db: &sled::Db,
 ) -> MailboxState {
     use MailboxState::*;
 
@@ -621,7 +625,7 @@ async fn handle_found_record(
                 // Try to resolve the current window
                 try_resolve_window(
                     pending_command, window_start, new_max, pending_queries, found, deadline,
-                    &user_hash, ev_tx, swarm, mailbox_indices, signing_key,
+                    &user_hash, ev_tx, swarm, mailbox_indices, signing_key, sled_db,
                 ).await
             } else {
                 info!("FetchingIndex: seq {response_seq} invalid/missing for {} (window {window_start}–{})",
@@ -630,7 +634,7 @@ async fn handle_found_record(
                 // Try to resolve — this seq being missing means it counts as a gap
                 try_resolve_window(
                     pending_command, window_start, max_found, pending_queries, found, deadline,
-                    &user_hash, ev_tx, swarm, mailbox_indices, signing_key,
+                    &user_hash, ev_tx, swarm, mailbox_indices, signing_key, sled_db,
                 ).await
             }
         }
@@ -664,6 +668,7 @@ async fn handle_not_found(
     state: MailboxState,
     mailbox_indices: &mut HashMap<Vec<u8>, u64>,
     signing_key: &SigningKey,
+    sled_db: &sled::Db,
 ) -> MailboxState {
     use MailboxState::*;
 
@@ -688,7 +693,7 @@ async fn handle_not_found(
             // Try to resolve the window — the missing seq counts as a gap
             try_resolve_window(
                 pending_command, window_start, max_found, pending_queries, found, deadline,
-                &user_hash, ev_tx, swarm, mailbox_indices, signing_key,
+                &user_hash, ev_tx, swarm, mailbox_indices, signing_key, sled_db,
             ).await
         }
         CollectingMessages { user_hash, messages, remaining, deadline } => {
@@ -710,13 +715,14 @@ async fn resume_pending_command(
     swarm: &mut libp2p::Swarm<NodeBehaviour>,
     mailbox_indices: &mut HashMap<Vec<u8>, u64>,
     signing_key: &SigningKey,
+    sled_db: &sled::Db,
 ) -> MailboxState {
     let kademlia = &mut swarm.behaviour_mut().kademlia;
 
     match pending {
         PendingNodeCommand::MailboxStore { recipient_hash, sender_hash, payload } => {
             let new_index = index + 1;
-            store_signed_envelope(kademlia, recipient_hash, sender_hash, payload, new_index, signing_key, mailbox_indices);
+            store_signed_envelope(kademlia, recipient_hash, sender_hash, payload, new_index, signing_key, mailbox_indices, sled_db);
             info!("MailboxStore (lazy): signed seq {new_index} for {}",
                 hex_fmt(recipient_hash, 8));
             MailboxState::Idle
@@ -750,6 +756,7 @@ fn store_signed_envelope(
     seq: u64,
     signing_key: &SigningKey,
     mailbox_indices: &mut HashMap<Vec<u8>, u64>,
+    sled_db: &sled::Db,
 ) {
     let seq_key = dht::mailbox_seq_key(recipient_hash, seq);
 
@@ -767,12 +774,18 @@ fn store_signed_envelope(
         let _ = kademlia.put_record(
             kad::Record {
                 key: seq_key,
-                value: envelope_bytes,
+                value: envelope_bytes.clone(),
                 publisher: None,
                 expires: None,
             },
             kad::Quorum::Majority,
         );
+        // Always save to Sled backup so offline messages survive even without DHT peers
+        if let Ok(tree) = sled_db.open_tree(SLED_MAILBOX_TREE) {
+            let key = [recipient_hash, &seq.to_be_bytes()].concat();
+            let _ = tree.insert(key, envelope_bytes);
+            let _ = tree.flush();
+        }
         mailbox_indices.insert(recipient_hash.to_vec(), seq);
     } else {
         warn!("store_signed_envelope: failed to serialize DhtEnvelope");
@@ -921,6 +934,7 @@ async fn handle_command(
     mailbox_indices: &mut HashMap<Vec<u8>, u64>,
     signing_key: &SigningKey,
     pending_profile_queries: &mut HashMap<kad::QueryId, oneshot::Sender<Option<Vec<u8>>>>,
+    sled_db: &sled::Db,
 ) -> MailboxState {
     let NodeBehaviour {
         ref mut kademlia,
@@ -947,7 +961,7 @@ async fn handle_command(
             // Fast path: index is in memory
             if let Some(&current_index) = mailbox_indices.get(&recipient_hash) {
                 let new_index = current_index + 1;
-                store_signed_envelope(kademlia, &recipient_hash, &sender_hash, &payload, new_index, signing_key, mailbox_indices);
+                store_signed_envelope(kademlia, &recipient_hash, &sender_hash, &payload, new_index, signing_key, mailbox_indices, sled_db);
                 info!("MailboxStore (fast): signed seq {new_index} for {}",
                     hex_fmt(&recipient_hash, 8));
                 return mailbox_state;
@@ -1083,6 +1097,7 @@ async fn try_resolve_window(
     swarm: &mut libp2p::Swarm<NodeBehaviour>,
     mailbox_indices: &mut HashMap<Vec<u8>, u64>,
     signing_key: &SigningKey,
+    sled_db: &sled::Db,
 ) -> MailboxState {
     // Scan from window_start upward looking for the first gap
     for s in window_start..(window_start + WINDOW_SIZE) {
@@ -1103,7 +1118,7 @@ async fn try_resolve_window(
             info!("FetchingIndex: gap at seq {s}, index={index} for {}",
                 hex_fmt(user_hash, 8));
             mailbox_indices.insert(user_hash.to_vec(), index);
-            return resume_pending_command(&pending_command, index, ev_tx, swarm, mailbox_indices, signing_key).await;
+            return resume_pending_command(&pending_command, index, ev_tx, swarm, mailbox_indices, signing_key, sled_db).await;
         }
     }
 

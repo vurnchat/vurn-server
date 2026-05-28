@@ -74,21 +74,36 @@ impl MailboxManager {
         payloads
     }
 
-    /// Get all stored messages from local Sled backup (fallback if DHT is unavailable).
-    #[allow(dead_code)]
-    pub async fn get_sled_backup(&self, user_hash: &[u8]) -> Vec<Vec<u8>> {
+    /// Read all stored messages from local Sled backup, then clear them.
+    /// Returns payloads extracted from envelopes.
+    pub async fn read_and_clear_sled_backup(&self, user_hash: &[u8]) -> Vec<Vec<u8>> {
         let tree = match self.db.open_tree(SLED_MAILBOX_TREE) {
             Ok(t) => t,
             Err(_) => return vec![],
         };
 
         let prefix = user_hash.to_vec();
-        let mut messages = vec![];
+        let mut keys_to_del = vec![];
+        let mut payloads = vec![];
 
         for result in tree.scan_prefix(&prefix) {
             match result {
-                Ok((_key, value)) => {
-                    messages.push(value.to_vec());
+                Ok((key, value)) => {
+                    if let Ok(envelope) = dht::deserialize_envelope(&value) {
+                        let seq = envelope.seq;
+                        // Verify envelope integrity
+                        if dht::verify_envelope(&envelope, user_hash).is_ok() {
+                            payloads.push(envelope.payload);
+                            keys_to_del.push(key);
+                        } else {
+                            warn!("Sled backup: invalid envelope for seq {seq}, removing");
+                            keys_to_del.push(key);
+                        }
+                    } else {
+                        // Legacy format — deliver raw
+                        payloads.push(value.to_vec());
+                        keys_to_del.push(key);
+                    }
                 }
                 Err(e) => {
                     warn!("Sled scan error: {e}");
@@ -96,7 +111,21 @@ impl MailboxManager {
             }
         }
 
-        messages
+        // Remove delivered messages from Sled to prevent duplicates
+        for key in &keys_to_del {
+            let _ = tree.remove(key);
+        }
+        let _ = tree.flush();
+
+        if !payloads.is_empty() {
+            info!(
+                "Mailbox: delivered {} offline messages from Sled backup for {}",
+                payloads.len(),
+                hex_fmt(user_hash, 8)
+            );
+        }
+
+        payloads
     }
 
     // ── Sled helpers ──

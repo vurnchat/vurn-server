@@ -1,0 +1,21 @@
+# VurnChat Bootstrap Nodes
+# ========================
+# Format: one multiaddr per line
+# Lines starting with # are comments
+#
+# These nodes act as entry points to the VurnChat P2P network.
+# The vurn-server binary fetches this list on startup (if no --bootstrap
+# is provided) and connects to a random node.
+#
+# To add your node to this list:
+#   1. Set a fixed P2P listen port (e.g., --listen-p2p /ip4/0.0.0.0/tcp/9001)
+#   2. Create a PR adding your multiaddr below
+#   3. Ensure your node is stable and publicly reachable
+#
+# Format: /ip4/<PUBLIC_IP>/tcp/<P2P_PORT>
+
+# Vurn WTFChan — main bootstrap node (VPS, Russia)
+# P2P port: 9001 (fixed)
+# WS port: 9443 (via socat TLS proxy → localhost:9000)
+# Domain: vurn.wtfchan.lol
+/ip4/87.232.123.7/tcp/9001

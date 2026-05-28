@@ -13,6 +13,7 @@
 //! ```
 
 use rustls::{pki_types::PrivateKeyDer, ServerConfig};
+use std::io::Read;
 use std::sync::Arc;
 use std::{fs::File, io::BufReader};
 use tokio::sync::{mpsc, RwLock};
@@ -38,6 +39,62 @@ fn parse_bootstrap_from_env() -> Vec<String> {
         .iter()
         .flat_map(|s| s.split_whitespace().map(|a| a.to_string()).collect::<Vec<_>>())
         .collect()
+}
+
+/// URL to the raw bootstrap nodes list on GitHub (main branch).
+const BOOTSTRAP_LIST_URL: &str =
+    "https://raw.githubusercontent.com/vurnchat/vurn-server/main/bootstrap_nodes.txt";
+
+/// Fetch bootstrap nodes from the GitHub repo's bootstrap_nodes.txt.
+///
+/// Returns a vector of multiaddress strings, picking a random node from the list.
+/// Uses a simple HTTP GET via ureq (no external runtime needed).
+/// On failure, returns an empty vec (graceful degradation — the node will still
+/// work, just won't auto-connect to the P2P network).
+fn fetch_bootstrap_nodes_from_github() -> Vec<String> {
+    let result: Result<Vec<String>, String> = (|| {
+        let resp = ureq::get(BOOTSTRAP_LIST_URL)
+            .call()
+            .map_err(|e| format!("HTTP request failed: {e}"))?;
+
+        let mut body = String::new();
+        resp
+            .into_body()
+            .as_reader()
+            .read_to_string(&mut body)
+            .map_err(|e| format!("Failed to read response body: {e}"))?;
+
+        let addrs: Vec<&str> = body
+            .lines()
+            .map(|l: &str| l.trim())
+            .filter(|l: &&str| !l.is_empty() && !l.starts_with('#'))
+            .collect();
+
+        if addrs.is_empty() {
+            return Err("No bootstrap addresses found in list".to_string());
+        }
+
+        // Pick a random address
+        use rand::seq::SliceRandom;
+        let mut rng = rand::rngs::OsRng;
+        let chosen: &&str = addrs.choose(&mut rng)
+            .ok_or_else(|| "Empty list after filtering".to_string())?;
+
+        Ok(vec![chosen.to_string()])
+    })();
+
+    match result {
+        Ok(addrs) => {
+            info!("Auto-fetched bootstrap node from GitHub: {}", addrs[0]);
+            addrs
+        }
+        Err(e) => {
+            warn!("Failed to auto-fetch bootstrap nodes from GitHub: {e}");
+            warn!("  URL: {}", BOOTSTRAP_LIST_URL);
+            warn!("  Node will operate in standalone mode (no P2P peers)");
+            vec![]
+        }
+    }
 }
 
 fn parse_port_from_env() -> Option<u16> {
@@ -187,7 +244,18 @@ async fn main() {
     };
 
     // Bootstrap to known nodes
-    for bs_addr in &args.bootstrap_addrs {
+    let bootstrap_addrs = if args.bootstrap_addrs.is_empty() {
+        // No bootstrap specified — auto-fetch from GitHub
+        info!("No bootstrap nodes specified, auto-fetching from GitHub...");
+        // Run in spawn_blocking to avoid blocking the async runtime on HTTP
+        tokio::task::spawn_blocking(|| fetch_bootstrap_nodes_from_github())
+            .await
+            .unwrap_or_default()
+    } else {
+        args.bootstrap_addrs
+    };
+
+    for bs_addr in &bootstrap_addrs {
         if let Ok(addr) = bs_addr.parse::<libp2p::Multiaddr>() {
             let _ = p2p_node.cmd_tx.send(NodeCommand::Dial { addr }).await;
             info!("Dialing bootstrap: {bs_addr}");
@@ -302,26 +370,35 @@ async fn handle_p2p_events(
                 }
             }
             NodeEvent::MailboxRetrieved { user_hash, messages } => {
-                info!("MailboxRetrieved: {} messages for {}",
+                info!("MailboxRetrieved: {} messages from DHT for {}",
                     messages.len(), ws::hex_fmt(&user_hash, 8));
 
-                if messages.is_empty() {
-                    continue;
+                let mut all_payloads = mailbox_mgr.handle_retrieval_result(&user_hash, &messages).await;
+
+                // If DHT returned nothing (no peers, offline), check Sled backup
+                if all_payloads.is_empty() {
+                    let sled_backup = mailbox_mgr.read_and_clear_sled_backup(&user_hash).await;
+                    if !sled_backup.is_empty() {
+                        info!("Sled backup delivered {} offline messages for {}",
+                            sled_backup.len(), ws::hex_fmt(&user_hash, 8));
+                        all_payloads = sled_backup;
+                    }
                 }
 
-                // Persist to Sled (seq-based dedup) and extract payloads for WS delivery
-                let payloads = mailbox_mgr.handle_retrieval_result(&user_hash, &messages).await;
+                if all_payloads.is_empty() {
+                    continue;
+                }
 
                 // Deliver ONLY to the matching user (privacy fix!)
                 let map = ws_state.read().await;
                 if let Some(senders) = map.clients.get(&user_hash) {
-                    for payload in &payloads {
+                    for payload in &all_payloads {
                         for tx in senders {
                             let _ = tx.send(payload.clone());
                         }
                     }
                 } else {
-                    info!("MailboxRetrieved: user {} not connected, stored in Sled backup",
+                    info!("MailboxRetrieved: user {} not connected, kept in Sled backup",
                         ws::hex_fmt(&user_hash, 8));
                 }
             }

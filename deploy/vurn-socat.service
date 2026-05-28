@@ -1,0 +1,61 @@
+# ── VurnChat — Socat TLS Proxy Service ──────────────────────────────
+# Source: https://github.com/vurnchat/vurn-server
+#
+# Installed by: install.sh (when --domain is provided)
+#
+# Architecture:
+#   socat listens on SOCAT_PORT with TLS termination
+#   Forwards plain TCP to vurn-server running on VURN_PORT (plain WS)
+#   This bypasses VPN/MTU issues with direct TLS connections.
+#
+# Usage:
+#   socat openssl-listen:<PORT>,fork,reuseaddr, \
+#         cert=<CERT_PATH>,key=<KEY_PATH>,verify=0 \
+#         tcp:127.0.0.1:<VURN_PORT>
+#
+# Dependencies:
+#   Requires vurn.service to be running (plain WS mode)
+#   Requires TLS certificates from Let's Encrypt
+#
+# Logs: journalctl -u vurn-socat.service -f
+#
+# Cert renewal hook: /etc/letsencrypt/renewal-hooks/deploy/vurn-restart.sh
+#   (restarts this service after cert renewal)
+
+[Unit]
+Description=VurnChat — Socat TLS Proxy (TLS port → plain WS backend)
+Documentation=https://github.com/vurnchat/vurn-server
+After=network-online.target vurn.service
+Requires=vurn.service
+PartOf=vurn.service
+
+[Service]
+Type=simple
+
+# socat runs as root to read Let's Encrypt certificates (0600 perms)
+# The actual vurn-server runs as user 'vurn' with no TLS.
+User=root
+Group=root
+
+# socat TLS termination:
+#   listens on SOCAT_PORT with TLS (cert+key)
+#   forwards to vurn-server on localhost:VURN_PORT (plain TCP/WS)
+# The actual port and cert paths are set by install.sh at service creation time.
+# Example:
+#   ExecStart=/usr/bin/socat openssl-listen:9443,fork,reuseaddr,cert=/etc/letsencrypt/live/example.com/fullchain.pem,key=/etc/letsencrypt/live/example.com/privkey.pem,verify=0 tcp:127.0.0.1:9000
+#
+# WARNING: The verify=0 disables client certificate verification.
+# This is intentional because socat is a TLS terminator for WSS clients.
+# Client authentication is handled at the application layer (identity-based).
+
+ExecStart=/usr/bin/socat OPENSSL-LISTEN:9443,fork,reuseaddr,cert=/etc/letsencrypt/live/vurn.example.com/fullchain.pem,key=/etc/letsencrypt/live/vurn.example.com/privkey.pem,verify=0 TCP:127.0.0.1:9000
+
+Restart=always
+RestartSec=5
+RestartMaxDelaySec=30
+
+# socat needs network access and cert reading capability
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

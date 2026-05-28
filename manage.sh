@@ -16,8 +16,10 @@ STATE_DIR="/var/lib/vurn"
 CONFIG_DIR="/etc/vurn"
 ENV_FILE="${CONFIG_DIR}/vurn.env"
 SERVICE_FILE="/etc/systemd/system/vurn.service"
+SOCAT_SERVICE_FILE="/etc/systemd/system/vurn-socat.service"
 LOGROTATE_FILE="/etc/logrotate.d/vurn"
 RENEWAL_HOOK="/etc/letsencrypt/renewal-hooks/deploy/vurn-restart.sh"
+SOCAT_PORT="9443"
 
 # ── Colors ──────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -103,6 +105,7 @@ do_update() {
         
         info "Stopping vurn service..."
         $SUDO systemctl stop vurn.service || true
+        $SUDO systemctl stop vurn-socat.service 2>/dev/null || true
         
         info "Replacing binary..."
         $SUDO mv "$_tmp_bin" "$INSTALL_PATH"
@@ -110,6 +113,9 @@ do_update() {
         
         info "Starting vurn service..."
         $SUDO systemctl start vurn.service
+        if [[ -f "$SOCAT_SERVICE_FILE" ]]; then
+            $SUDO systemctl start vurn-socat.service
+        fi
         ok "VurnChat node updated successfully!"
     else
         err "Failed to download latest release. Check internet connection or repository status."
@@ -144,6 +150,8 @@ do_reconfigure() {
         SSL="y"
         read -r -p "   Email for Let's Encrypt [admin@${DOMAIN}]: " input_email
         EMAIL="${input_email:-admin@${DOMAIN}}"
+        read -r -p "   Socat TLS listen port [${SOCAT_PORT}]: " input_socat
+        SOCAT_PORT="${input_socat:-$SOCAT_PORT}"
     fi
 
     BOOTSTRAP_ADDRS=()
@@ -182,12 +190,8 @@ do_reconfigure() {
     $SUDO tee "$ENV_FILE" > /dev/null <<ENVEOF
 # VurnChat Server Configuration — Reconfigured on $(date -I)
 VURN_PORT=${PORT}
+VURN_P2P_LISTEN=/ip4/0.0.0.0/tcp/9001
 ENVEOF
-
-    if [[ "$SSL" == "y" ]]; then
-        echo "VURN_CERT=${CERT_PATH}" | $SUDO tee -a "$ENV_FILE" > /dev/null
-        echo "VURN_KEY=${KEY_PATH}" | $SUDO tee -a "$ENV_FILE" > /dev/null
-    fi
 
     if [[ ${#BOOTSTRAP_ADDRS[@]} -gt 0 ]]; then
         echo "VURN_BOOTSTRAP=${BOOTSTRAP_ADDRS[*]}" | $SUDO tee -a "$ENV_FILE" > /dev/null
@@ -231,20 +235,46 @@ SERVICEEOF
 
     $SUDO chmod 644 "$SERVICE_FILE"
 
+    # Socat TLS proxy service (if SSL enabled)
     if [[ "$SSL" == "y" ]]; then
+        $SUDO tee "$SOCAT_SERVICE_FILE" > /dev/null <<SOCATEOF
+[Unit]
+Description=VurnChat — Socat TLS Proxy (:${SOCAT_PORT} TLS -> :${PORT} plain WS)
+Documentation=https://github.com/${REPO}
+After=network-online.target vurn.service
+Requires=vurn.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/socat openssl-listen:${SOCAT_PORT},fork,reuseaddr,cert=${CERT_PATH},key=${KEY_PATH},verify=0 tcp:127.0.0.1:${PORT}
+Restart=always
+RestartSec=5
+RestartMaxDelaySec=30
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+SOCATEOF
+        $SUDO chmod 644 "$SOCAT_SERVICE_FILE"
+
         $SUDO mkdir -p "$(dirname "$RENEWAL_HOOK")"
         $SUDO tee "$RENEWAL_HOOK" > /dev/null <<'HOOKEOF'
 #!/bin/bash
-systemctl restart vurn.service
+systemctl restart vurn-socat.service
 HOOKEOF
         $SUDO chmod +x "$RENEWAL_HOOK"
     else
+        $SUDO rm -f "$SOCAT_SERVICE_FILE" 2>/dev/null || true
         $SUDO rm -f "$RENEWAL_HOOK"
     fi
 
     info "Applying configuration changes..."
     $SUDO systemctl daemon-reload
     $SUDO systemctl restart vurn.service
+    if [[ -f "$SOCAT_SERVICE_FILE" ]]; then
+        $SUDO systemctl enable vurn-socat.service 2>/dev/null || true
+        $SUDO systemctl restart vurn-socat.service 2>/dev/null || true
+    fi
     ok "Node successfully reconfigured and restarted!"
 }
 
@@ -259,12 +289,15 @@ do_uninstall() {
         exit 0
     fi
 
-    info "Stopping and disabling service..."
+    info "Stopping and disabling services..."
+    $SUDO systemctl stop vurn-socat.service 2>/dev/null || true
+    $SUDO systemctl disable vurn-socat.service 2>/dev/null || true
     $SUDO systemctl stop vurn.service 2>/dev/null || true
     $SUDO systemctl disable vurn.service 2>/dev/null || true
 
     info "Removing files and service units..."
     $SUDO rm -f "$SERVICE_FILE"
+    $SUDO rm -f "$SOCAT_SERVICE_FILE"
     $SUDO rm -f "$INSTALL_PATH"
     $SUDO rm -f "$LOGROTATE_FILE"
     $SUDO rm -f "$RENEWAL_HOOK"

@@ -1,6 +1,6 @@
 [package]
 name = "vurn-server"
-version = "0.6.0"
+version = "0.6.2"
 edition = "2021"
 description = "Blind WebSocket relay server for the VurnChat messenger"
 license = "MIT OR Apache-2.0"
@@ -41,3 +41,6 @@ rustls-pki-types = "1"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
 tower = "0.4"
+
+# HTTP client for auto-fetching bootstrap node list from GitHub
+ureq = { version = "3", default-features = false, features = ["_tls"] }

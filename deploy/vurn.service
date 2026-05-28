@@ -2,8 +2,11 @@
 # Source: https://github.com/vurnchat/vurn-server
 #
 # Installed by: install.sh
-# Manually: sudo cp deploy/vurn.service /etc/systemd/system/vurn.service
-#           sudo systemctl daemon-reload && sudo systemctl enable --now vurn
+#
+# Architecture:
+#   vurn-server runs in plain WS mode on VURN_PORT
+#   socat (optional) handles TLS on SOCAT_PORT, forwards to :VURN_PORT
+#   This bypasses VPN/MTU issues with direct TLS connections.
 #
 # Data directory: /var/lib/vurn/
 #   ├── vurn_mailbox_<PORT>.db  (Sled DB — mailbox backup)
@@ -12,6 +15,7 @@
 # Config: /etc/vurn/vurn.env
 #
 # Logs: journalctl -u vurn.service -f
+# Socat logs: journalctl -u vurn-socat.service -f
 
 [Unit]
 Description=VurnChat — Post-Quantum Encrypted P2P Messenger Node
@@ -22,38 +26,24 @@ Wants=network-online.target
 [Service]
 Type=simple
 
-# ── User ─────────────────────────────────────────────────────────────
-# Runs as a dedicated system user with no login shell.
-# Created by install.sh or manually:
-#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin vurn
 User=vurn
 Group=vurn
 
-# ── Working directory & state ───────────────────────────────────────
 WorkingDirectory=/var/lib/vurn
 StateDirectory=vurn
 StateDirectoryMode=0750
 
-# ── Environment ──────────────────────────────────────────────────────
-# Load config from /etc/vurn/vurn.env (created by install.sh)
 EnvironmentFile=-/etc/vurn/vurn.env
 
-# ── Startup command ─────────────────────────────────────────────────
-# The binary reads env vars (VURN_PORT, VURN_CERT, VURN_KEY, VURN_P2P_LISTEN, VURN_BOOTSTRAP)
-# as fallback defaults, so we just pass the explicit flags if needed.
-# VURN_CERT/VURN_KEY trigger TLS mode automatically when set.
 ExecStart=/usr/local/bin/vurn-server
 
-# ── Restart policy ──────────────────────────────────────────────────
 Restart=always
 RestartSec=5
 RestartMaxDelaySec=30
 
-# ── Resource limits ─────────────────────────────────────────────────
 MemoryMax=512M
 IOWriteBandwidthMax=/var/lib/vurn 10M
 
-# ── Security hardening ──────────────────────────────────────────────
 CapabilityBoundingSet=
 NoNewPrivileges=true
 PrivateTmp=true
@@ -69,7 +59,6 @@ MemoryDenyWriteExecute=true
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 
-# ── File descriptor limit ───────────────────────────────────────────
 LimitNOFILE=1024
 
 [Install]
