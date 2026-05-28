@@ -34,7 +34,7 @@ jobs:
             os: ubuntu-24.04-arm
             strip: aarch64-linux-gnu-strip
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-latest
             strip: strip
           - target: aarch64-apple-darwin
             os: macos-latest
