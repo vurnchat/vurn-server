@@ -577,18 +577,22 @@ if [[ "$IS_MAC" == "true" ]]; then
     HEALTH_OK=true
 else
     info "Waiting for service to start (up to 15 seconds)..."
-    HEALTH_URL="http://127.0.0.1:${PORT}/health"
 
     for i in $(seq 1 15); do
         sleep 1
         if $SUDO systemctl is-active --quiet vurn.service 2>/dev/null; then
+            if [[ "$SSL" == "y" && -n "$DOMAIN" ]]; then
+                # TLS mode — can't curl HTTP, just check systemd
+                HEALTH_OK=true
+                break
+            fi
             if command -v curl &>/dev/null; then
-                if curl -sf "$HEALTH_URL" > /dev/null 2>&1; then
+                if curl -sf "http://127.0.0.1:${PORT}/health" > /dev/null 2>&1; then
                     HEALTH_OK=true
                     break
                 fi
             elif command -v wget &>/dev/null; then
-                if wget -q -O /dev/null "$HEALTH_URL" 2>/dev/null; then
+                if wget -q -O /dev/null "http://127.0.0.1:${PORT}/health" 2>/dev/null; then
                     HEALTH_OK=true
                     break
                 fi
