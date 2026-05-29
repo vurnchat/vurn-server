@@ -4,10 +4,9 @@
 //! in a Sled embedded database for durability.
 
 use crate::p2p::dht;
-use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{info, trace, warn};
+use tracing::{info, warn};
 
 /// Prefix for Sled-tree namespacing.
 /// Made `pub` so that P2P node (get_sled_max_seq) uses the same constant.
@@ -29,14 +28,13 @@ impl MailboxManager {
         }
     }
 
-    /// Handle a DHT retrieval result — persist to Sled with seq-based dedup and return payloads.
+    /// Handle a DHT retrieval result — extract payloads from envelopes.
     ///
     /// Each message is expected to be a serialized `DhtEnvelope`. We deserialize
-    /// to extract the seq (for Sled dedup key) and the payload (for WS delivery).
-    /// Legacy (non-envelope) messages fall back to timestamp-based keys.
+    /// to extract the payload (for WS delivery). Legacy (non-envelope) messages
+    /// are passed through as-is.
     ///
-    /// Dedup: if a seq-key already exists in Sled (from a previous retrieval),
-    /// the message is skipped — it was already delivered to the client.
+    /// Dedup is handled by the caller via `check_and_mark_delivered` in ws.rs.
     pub async fn handle_retrieval_result(
         &self,
         user_hash: &[u8],
@@ -49,53 +47,33 @@ impl MailboxManager {
         }
 
         let mut payloads = Vec::with_capacity(messages.len());
-        // Track seqs already stored in this batch to avoid intra-batch duplicates
-        let mut batch_seqs: HashSet<u64> = HashSet::new();
 
         for msg in messages {
             match dht::deserialize_envelope(msg) {
                 Ok(envelope) => {
-                    let seq = envelope.seq;
-                    // Dedup: skip if already delivered (Sled) or already in this batch
-                    if batch_seqs.contains(&seq) || self.is_seq_already_stored(user_hash, seq) {
-                        trace!("Mailbox: skipping already-delivered seq {seq} for {}",
-                            hex_fmt(user_hash, 8));
-                        continue;
+                    if dht::verify_envelope(&envelope, user_hash).is_ok() {
+                        payloads.push(envelope.payload.clone());
+                    } else {
+                        warn!("Mailbox: invalid envelope seq {} for {}",
+                            envelope.seq, hex_fmt(user_hash, 8));
                     }
-                    batch_seqs.insert(seq);
-                    // Seq-based key = dedup within user_hash
-                    if let Err(e) = self.write_sled_raw_seq(user_hash, seq, msg) {
-                        warn!("Sled backup write failed for seq {}: {e}", seq);
-                    }
-                    payloads.push(envelope.payload.clone());
                 }
                 Err(_) => {
-                    // Legacy non-envelope format — store with timestamp key
-                    if let Err(e) = self.write_sled_raw(user_hash, msg) {
-                        warn!("Sled backup write failed for legacy data: {e}");
-                    }
+                    // Legacy non-envelope format — deliver raw
                     payloads.push(msg.clone());
                 }
             }
         }
 
-        info!(
-            "Mailbox: retrieved {} messages from DHT for {}",
-            payloads.len(),
-            hex_fmt(user_hash, 8)
-        );
+        if !payloads.is_empty() {
+            info!(
+                "Mailbox: retrieved {} messages from DHT for {}",
+                payloads.len(),
+                hex_fmt(user_hash, 8)
+            );
+        }
 
         payloads
-    }
-
-    /// Check if a seq-based key already exists in Sled (message was already delivered).
-    fn is_seq_already_stored(&self, user_hash: &[u8], seq: u64) -> bool {
-        let tree = match self.db.open_tree(SLED_MAILBOX_TREE) {
-            Ok(t) => t,
-            Err(_) => return false,
-        };
-        let key = [user_hash, &seq.to_be_bytes()].concat();
-        tree.contains_key(key).unwrap_or(false)
     }
 
     /// Read all stored messages from local Sled backup, then clear them.
@@ -150,32 +128,6 @@ impl MailboxManager {
         }
 
         payloads
-    }
-
-    // ── Sled helpers ──
-
-    /// Write raw data with a timestamp-based key (legacy fallback, no dedup).
-    fn write_sled_raw(&self, user_hash: &[u8], data: &[u8]) -> Result<(), sled::Error> {
-        let tree = self.db.open_tree(SLED_MAILBOX_TREE)?;
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
-        let key = [user_hash, &ts.to_le_bytes()].concat();
-        tree.insert(key, data)?;
-        tree.flush()?;
-        Ok(())
-    }
-
-    /// Write envelope data with a seq-based key — dedup-safe.
-    /// Key format: `[user_hash || seq(8-byte BE)]`
-    /// Same seq always maps to the same key, so duplicates overwrite cleanly.
-    fn write_sled_raw_seq(&self, user_hash: &[u8], seq: u64, data: &[u8]) -> Result<(), sled::Error> {
-        let tree = self.db.open_tree(SLED_MAILBOX_TREE)?;
-        let key = [user_hash, &seq.to_be_bytes()].concat();
-        tree.insert(key, data)?;
-        tree.flush()?;
-        Ok(())
     }
 }
 

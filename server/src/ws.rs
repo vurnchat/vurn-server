@@ -16,9 +16,9 @@ use axum::{
     Router,
 };
 use futures_util::{sink::SinkExt, stream::StreamExt};
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{error, info, trace, warn};
 
@@ -75,7 +75,6 @@ impl TokenBucket {
 }
 
 /// Internal state of the WebSocket gateway.
-#[derive(Default)]
 pub struct GatewayStateInner {
     /// WS senders: user_hash → list of send channels
     pub clients: HashMap<Vec<u8>, Vec<mpsc::UnboundedSender<Vec<u8>>>>,
@@ -85,11 +84,54 @@ pub struct GatewayStateInner {
     pub p2p_connected: bool,
     /// Per-client rate limiters: session_id → (store_bucket, lookup_bucket)
     pub rate_limiters: HashMap<Vec<u8>, (TokenBucket, TokenBucket)>,
+    /// Delivered message hashes per user (dedup across local/GossipSub/mailbox channels).
+    pub delivered_hashes: HashMap<Vec<u8>, HashSet<u64>>,
 }
 
-use std::collections::HashMap;
+impl Default for GatewayStateInner {
+    fn default() -> Self {
+        Self {
+            clients: HashMap::new(),
+            p2p_cmd_tx: None,
+            p2p_connected: false,
+            rate_limiters: HashMap::new(),
+            delivered_hashes: HashMap::new(),
+        }
+    }
+}
 
 pub type SharedState = Arc<RwLock<GatewayStateInner>>;
+
+/// Maximum number of delivered message hashes to remember per user.
+const MAX_DELIVERED_HASHES: usize = 512;
+
+/// Compute a u64 hash of payload bytes for dedup.
+fn payload_hash(data: &[u8]) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    data.hash(&mut h);
+    h.finish()
+}
+
+/// Check if a payload was already delivered to this user, and mark it as delivered if not.
+/// Returns `true` if this is a NEW message (should be delivered), `false` if duplicate.
+pub fn check_and_mark_delivered(
+    delivered: &mut HashMap<Vec<u8>, HashSet<u64>>,
+    user_hash: &[u8],
+    payload: &[u8],
+) -> bool {
+    let hash = payload_hash(payload);
+    let hashes = delivered.entry(user_hash.to_vec()).or_default();
+    if hashes.contains(&hash) {
+        trace!("Dedup: skipping duplicate for {} (hash {hash:x})", hex_fmt(user_hash, 8));
+        return false;
+    }
+    // Keep set bounded — clear entire set when full (simple, deterministic)
+    if hashes.len() >= MAX_DELIVERED_HASHES {
+        hashes.clear();
+    }
+    hashes.insert(hash);
+    true
+}
 
 // ── Router ──────────────────────────────────────────────────────────
 
@@ -199,6 +241,7 @@ async fn handle_ws_connection(socket: WebSocket, gateway_state: SharedState) {
             if ws_sink.send(Message::Binary(payload)).await.is_err() {
                 info!("Forward task: client {} disconnected", hex_fmt(&sid_clone, 8));
                 let mut map = state_clone.write().await;
+                map.delivered_hashes.remove(sid_clone.as_ref());
                 if let Some(senders) = map.clients.get_mut(sid_clone.as_ref()) {
                     senders.retain(|s| !s.is_closed());
                     if senders.is_empty() {
@@ -210,26 +253,7 @@ async fn handle_ws_connection(socket: WebSocket, gateway_state: SharedState) {
         }
     });
 
-    // Step 3.5: Spawn periodic mailbox poll (every 30s) — catches messages that GossipSub missed
-    let poll_cancel = Arc::new(AtomicBool::new(false));
-    let poll_cancel_ref = poll_cancel.clone();
-    let sid_poll = session_id.clone();
-    let state_poll = gateway_state.clone();
-    let poll_task = tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(30)).await;
-            if poll_cancel_ref.load(Ordering::Relaxed) {
-                break;
-            }
-            let map = state_poll.read().await;
-            if let Some(ref cmd_tx) = map.p2p_cmd_tx {
-                let cmd = NodeCommand::MailboxRetrieve {
-                    user_hash: sid_poll.to_vec(),
-                };
-                let _ = cmd_tx.send(cmd).await;
-            }
-        }
-    });
+
 
     // Step 4: Read messages from client
     while let Some(msg) = ws_stream.next().await {
@@ -253,13 +277,12 @@ async fn handle_ws_connection(socket: WebSocket, gateway_state: SharedState) {
 
     // Step 5: Cleanup
     info!("Client disconnected: {}", hex_fmt(&session_id, 8));
-    // Cancel periodic mailbox poll
-    poll_cancel.store(true, Ordering::Relaxed);
-    poll_task.abort();
     {
         let mut map = gateway_state.write().await;
         // Remove rate limiters for this client
         map.rate_limiters.remove(session_id.as_ref());
+        // Clean up delivered hashes for this client
+        map.delivered_hashes.remove(session_id.as_ref());
         // Clean up senders
         if let Some(senders) = map.clients.get_mut(session_id.as_ref()) {
             senders.retain(|s| !s.is_closed());
@@ -314,17 +337,22 @@ async fn relay_or_p2p(state: &SharedState, sender_id: &[u8], data: &[u8]) {
     forward.extend_from_slice(sender_id);
     forward.extend_from_slice(payload);
 
-    // Try local delivery
+    // Try local delivery with dedup (clone senders first to avoid borrow conflict)
     let delivered = {
-        let map = state.read().await;
-        if let Some(senders) = map.clients.get(recipient_id) {
-            let mut ok = false;
-            for tx in senders {
-                if tx.send(forward.clone()).is_ok() {
-                    ok = true;
+        let mut map = state.write().await;
+        let senders = map.clients.get(recipient_id).cloned();
+        if let Some(ref senders) = senders {
+            if check_and_mark_delivered(&mut map.delivered_hashes, recipient_id, &forward) {
+                let mut ok = false;
+                for tx in senders {
+                    if tx.send(forward.clone()).is_ok() {
+                        ok = true;
+                    }
                 }
+                ok
+            } else {
+                true // duplicate already marked, treat as delivered
             }
-            ok
         } else {
             false
         }
@@ -332,21 +360,19 @@ async fn relay_or_p2p(state: &SharedState, sender_id: &[u8], data: &[u8]) {
 
     if delivered {
         info!("Local relay: {} → {}", hex_fmt(sender_id, 8), hex_fmt(recipient_id, 8));
-        // Recipient is on this node — skip GossipSub to avoid duplicates.
-        // Still store in mailbox for offline durability.
-    } else {
-        // Try GossipSub realtime delivery (for recipients on other nodes)
-        {
-            let map = state.read().await;
-            if let Some(ref cmd_tx) = map.p2p_cmd_tx {
-                let topic = hex::encode(recipient_id);
-                let cmd = NodeCommand::Publish {
-                    topic: topic.clone(),
-                    data: forward.clone(),
-                };
-                let _ = cmd_tx.send(cmd).await;
-                trace!("GossipSub publish to topic {} for {}", topic, hex_fmt(recipient_id, 8));
-            }
+    }
+
+    // Always publish via GossipSub — hash dedup on receiver side prevents duplicates
+    {
+        let map = state.read().await;
+        if let Some(ref cmd_tx) = map.p2p_cmd_tx {
+            let topic = hex::encode(recipient_id);
+            let cmd = NodeCommand::Publish {
+                topic: topic.clone(),
+                data: forward.clone(),
+            };
+            let _ = cmd_tx.send(cmd).await;
+            trace!("GossipSub publish to topic {} for {}", topic, hex_fmt(recipient_id, 8));
         }
     }
 

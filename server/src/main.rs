@@ -348,11 +348,17 @@ async fn handle_p2p_events(
                 // If topic is present (GossipSub), route to the specific recipient
                 if !topic.is_empty() {
                     if let Ok(recipient_id) = hex::decode(&topic) {
-                        let map = ws_state.read().await;
-                        if let Some(senders) = map.clients.get(&recipient_id) {
-                            info!("GossipSub message from {from} routed to recipient ({} bytes)", data.len());
-                            for tx in senders {
-                                let _ = tx.send(data.clone());
+                        let mut map = ws_state.write().await;
+                        // Clone senders to release immutable borrow before mutable dedup check
+                        let senders = map.clients.get(&recipient_id).cloned();
+                        if let Some(ref senders) = senders {
+                            if ws::check_and_mark_delivered(&mut map.delivered_hashes, &recipient_id, &data) {
+                                info!("GossipSub message from {from} routed to recipient ({} bytes)", data.len());
+                                for tx in senders {
+                                    let _ = tx.send(data.clone());
+                                }
+                            } else {
+                                trace!("GossipSub: duplicate for {}, dropped", ws::hex_fmt(&recipient_id, 8));
                             }
                         } else {
                             trace!("GossipSub message for {}/{}b — recipient not connected on this node",
@@ -389,13 +395,26 @@ async fn handle_p2p_events(
                     continue;
                 }
 
-                // Deliver ONLY to the matching user (privacy fix!)
-                let map = ws_state.read().await;
-                if let Some(senders) = map.clients.get(&user_hash) {
+                // Deliver ONLY to the matching user with hash dedup
+                let mut map = ws_state.write().await;
+                // Clone senders to release immutable borrow before mutable dedup check
+                let senders = map.clients.get(&user_hash).cloned();
+                if let Some(ref senders) = senders {
+                    let mut delivered_count = 0usize;
+                    let mut dupes = 0usize;
                     for payload in &all_payloads {
-                        for tx in senders {
-                            let _ = tx.send(payload.clone());
+                        if ws::check_and_mark_delivered(&mut map.delivered_hashes, &user_hash, payload) {
+                            for tx in senders {
+                                let _ = tx.send(payload.clone());
+                            }
+                            delivered_count += 1;
+                        } else {
+                            dupes += 1;
                         }
+                    }
+                    if dupes > 0 {
+                        info!("MailboxRetrieved: {} new, {} dupes for {}",
+                            delivered_count, dupes, ws::hex_fmt(&user_hash, 8));
                     }
                 } else {
                     info!("MailboxRetrieved: user {} not connected, kept in Sled backup",
