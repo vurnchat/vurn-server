@@ -1,6 +1,6 @@
 [package]
 name = "vurn-core"
-version = "0.6.6"
+version = "0.7.0"
 edition = "2021"
 description = "Post-quantum cryptographic core of the VurnChat messenger"
 license = "MIT OR Apache-2.0"
@@ -14,6 +14,7 @@ pbkdf2 = { version = "0.12", features = ["simple"] }
 hmac = "0.12"
 base64 = "0.22"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+ml-dsa = { version = "0.1", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 hex = "0.4"

@@ -20,6 +20,7 @@
 //! ```
 
 pub mod identity;
+pub mod signing;
 
 use aes_gcm::{
     aead::{Aead, KeyInit},
@@ -428,6 +429,53 @@ mod tests {
             assert_eq!(g.len(), 5, "Each group must be 5 digits");
             assert!(g.chars().all(|c| c.is_ascii_digit()), "Groups must be digits only");
         }
+    }
+
+    /// Full sender-authentication pipeline:
+    /// 1. Alice signs the text with her ML-DSA key (payload inside ciphertext)
+    /// 2. Alice encrypts the signed payload for Bob
+    /// 3. Relay stores/forwards the opaque ciphertext
+    /// 4. Bob decrypts and verifies Alice's signature with her stored key
+    ///
+    /// Also proves an attacker who can encrypt to Bob (anyone knowing Bob's
+    /// public key) still cannot forge a message from Alice.
+    #[test]
+    fn test_signed_message_mailbox_roundtrip() {
+        let (pk_alice, _) = VurnCipher::generate_keypair();
+        let (pk_bob, sk_bob) = VurnCipher::generate_keypair();
+        let (sig_pk_alice, sig_sk_alice) = crate::signing::generate_signing_keypair();
+        let (_sig_pk_eve, sig_sk_eve) = crate::signing::generate_signing_keypair();
+
+        let original = b"Authenticated message through the mailbox";
+
+        // Alice signs and encrypts for Bob.
+        let signed = crate::signing::sign_message(&sig_sk_alice, original).expect("sign");
+        let encrypted = VurnCipher::encrypt(&pk_bob, &signed).expect("encrypt");
+
+        // Mailbox frame: [alice_hash_len][alice_hash][ciphertext]
+        let alice_hash = VurnCipher::hash_public_key(&pk_alice);
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&(alice_hash.len() as u16).to_le_bytes());
+        frame.extend_from_slice(&alice_hash);
+        frame.extend_from_slice(&encrypted);
+
+        // Bob receives, decrypts, verifies against stored Alice key.
+        let id_len = u16::from_le_bytes([frame[0], frame[1]]) as usize;
+        let claimed_sender = &frame[2..2 + id_len];
+        assert_eq!(claimed_sender, alice_hash.as_slice());
+        let decrypted = VurnCipher::decrypt(&sk_bob, &frame[2 + id_len..]).expect("decrypt");
+        let verified = crate::signing::verify_message(&sig_pk_alice, &decrypted).expect("verify");
+        assert_eq!(verified, original);
+
+        // Eve forges: she can encrypt to Bob but cannot sign as Alice.
+        let forged = crate::signing::sign_message(&sig_sk_eve, b"I am Alice").expect("forge sign");
+        let forged_ct = VurnCipher::encrypt(&pk_bob, &forged).expect("forge encrypt");
+        let forged_plain = VurnCipher::decrypt(&sk_bob, &forged_ct).expect("decrypt forged");
+        assert_eq!(
+            crate::signing::verify_message(&sig_pk_alice, &forged_plain),
+            Err(crate::signing::VerifyStatus::BadSignature),
+            "Eve's message must fail verification as Alice"
+        );
     }
 
     /// Simulates the full mailbox delivery pipeline:
