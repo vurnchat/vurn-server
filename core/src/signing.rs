@@ -93,6 +93,53 @@ pub fn sign_message(secret_key: &[u8], text: &[u8]) -> Result<Vec<u8>, String> {
     Ok(payload)
 }
 
+/// Produces a **raw** ML-DSA-87 signature over `data` (no payload framing).
+///
+/// Used for signing fixed-format structures where the byte layout is known
+/// (e.g. the signed prekey in the identity bundle), as opposed to message
+/// payloads which use the framed [`sign_message`] format.
+pub fn sign_raw(secret_key: &[u8], data: &[u8]) -> Result<Vec<u8>, String> {
+    if secret_key.len() != SECRET_KEY_LEN {
+        return Err(format!(
+            "Invalid signing secret key: expected {} bytes, got {}",
+            SECRET_KEY_LEN,
+            secret_key.len()
+        ));
+    }
+    let seed_arr: ml_dsa::Seed = secret_key
+        .try_into()
+        .map_err(|_| "Signing secret key must be exactly 32 bytes".to_string())?;
+    let signing_key = SigningKey::<MlDsa87>::from_seed(&seed_arr);
+    let sig = signing_key
+        .try_sign(data)
+        .map_err(|e| format!("ML-DSA signing failed: {}", e))?;
+    Ok(sig.to_bytes().as_slice().to_vec())
+}
+
+/// Verifies a **raw** ML-DSA-87 signature (produced by [`sign_raw`]) over
+/// `data`. Returns `Ok(())` on success, or a [`VerifyStatus`] describing why
+/// verification failed.
+pub fn verify_raw(public_key: &[u8], data: &[u8], sig: &[u8]) -> Result<(), VerifyStatus> {
+    if public_key.is_empty() {
+        return Err(VerifyStatus::NoKey);
+    }
+    if public_key.len() != PUBLIC_KEY_LEN {
+        return Err(VerifyStatus::BadPublicKey);
+    }
+    if sig.len() != SIGNATURE_LEN {
+        return Err(VerifyStatus::BadSignature);
+    }
+    let enc_pk = ml_dsa::EncodedVerifyingKey::<MlDsa87>::try_from(public_key)
+        .map_err(|_| VerifyStatus::BadPublicKey)?;
+    let enc_sig = ml_dsa::EncodedSignature::<MlDsa87>::try_from(sig)
+        .map_err(|_| VerifyStatus::BadSignature)?;
+    let vk = VerifyingKey::<MlDsa87>::decode(&enc_pk);
+    let signature = MldsaSignature::<MlDsa87>::decode(&enc_sig)
+        .ok_or(VerifyStatus::BadSignature)?;
+    vk.verify(data, &signature)
+        .map_err(|_| VerifyStatus::BadSignature)
+}
+
 /// Splits a payload into `(signature, text)` if it has valid signature framing.
 pub fn split_payload(payload: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
     if payload.len() < 2 {
@@ -162,6 +209,31 @@ mod tests {
         let payload = sign_message(&sk, b"").expect("sign");
         let recovered = verify_message(&pk, &payload).expect("verify");
         assert!(recovered.is_empty());
+    }
+
+    #[test]
+    fn test_raw_sign_verify() {
+        let (pk, sk) = generate_signing_keypair();
+        let data = b"signed prekey binding material";
+
+        let sig = sign_raw(&sk, data).expect("raw sign");
+        assert_eq!(sig.len(), SIGNATURE_LEN, "raw signature must be exactly 4627 bytes");
+        assert!(verify_raw(&pk, data, &sig).is_ok());
+
+        // Tampered message / signature must fail.
+        assert!(verify_raw(&pk, b"tampered", &sig).is_err());
+        let mut bad_sig = sig.clone();
+        bad_sig[10] ^= 0x01;
+        assert!(verify_raw(&pk, data, &bad_sig).is_err());
+
+        // Wrong key must fail.
+        let (other_pk, _) = generate_signing_keypair();
+        assert!(verify_raw(&other_pk, data, &sig).is_err());
+
+        // Size/format validation.
+        assert!(verify_raw(&pk, data, &[]).is_err());
+        assert!(verify_raw(&[], data, &sig).is_err());
+        assert_eq!(verify_raw(&vec![1u8], data, &sig), Err(VerifyStatus::BadPublicKey));
     }
 
     #[test]

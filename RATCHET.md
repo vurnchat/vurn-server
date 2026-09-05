@@ -207,9 +207,15 @@ property tests (ping-pong, burst turns, distinct ciphertexts, replay
 rejection, tamper, persistence mid-conversation, forward secrecy,
 reordering, sustained pseudo-random traffic). All 41 `vurn-core` tests
 green. New deps in core: `x25519-dalek`.
-Stage B: identity bundle v0.9 — extend `identity.rs` (blob carries X25519
-identity + signed prekey + signature), update invites, contact records,
-registration. Requires one more re-registration of test usernames.
+Stage B: **DONE.** `vurn-core/src/identity.rs` — `IdentityBundle`
+(ik_kem, ik_x, sig_pk, spk_kem, spk_x, spk_sig) with versioned
+encode/decode (0x09 magic, legacy-tolerant: v0.7 payloads decode with
+empty prekey fields), `build_identity_bundle` (fresh signed prekey,
+ML-DSA-bound via raw signature over `spk_kem ‖ spk_x`),
+`verify_prekey`, plus v9 variants of profile registration/resolution
+and invite generate/parse. Core version bumped to 0.8.0. 51 tests
+green. Stage C (client wiring) still requires re-registration of test
+usernames.
 Stage C: client wiring — per-contact session store in IndexedDB (encrypted),
 send/receive paths use sessions, init on first message to a new contact,
 session persistence across reloads, legacy (v0.7) ciphertext fallback,

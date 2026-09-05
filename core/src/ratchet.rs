@@ -161,7 +161,8 @@ fn x25519_shared(sk: &[u8; 32], pk: &[u8; 32]) -> Result<[u8; 32], DecryptError>
     Ok(out)
 }
 
-fn x25519_keypair() -> ([u8; 32], [u8; 32]) {
+/// Generates a fresh X25519 ratchet keypair as raw `(public, secret)` bytes.
+pub fn x25519_keypair() -> ([u8; 32], [u8; 32]) {
     let sk = XStaticSecret::random_from_rng(OsRng);
     let pk = XPublicKey::from(&sk);
     (pk.to_bytes(), sk.to_bytes())

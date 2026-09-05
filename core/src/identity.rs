@@ -32,7 +32,7 @@
 //! [2B u16 LE kem_pk_len][ML-KEM pk][2B u16 LE sig_pk_len][ML-DSA-87 pk]
 //! ```
 
-use crate::VurnCipher;
+use crate::{signing, VurnCipher};
 use base64::Engine;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -46,6 +46,167 @@ const VURN_SEARCH_SALT: &[u8] = b"VURN_SEARCH";
 
 /// Salt for deriving the **profile encryption key** (what decrypts the blob).
 const VURN_PROFILE_ENC_SALT: &[u8] = b"VURN_PROFILE_ENC";
+
+// ── v0.9 identity bundle (forward-secrecy bootstrap material) ────────
+
+/// Wire-format version byte of the v0.9 identity bundle.
+const IDENTITY_V9_VERSION: u8 = 0x09;
+
+/// X25519 public key size.
+const X25519_PK_LEN: usize = 32;
+/// ML-KEM-1024 public key size (matches `ratchet::KEM_PK_LEN`).
+const KEM_PK_LEN: usize = 1568;
+
+/// Full public identity of a user, as carried by the v0.9 profile blob,
+/// invite links, and contact records. Everything needed to bootstrap a
+/// ratchet session with this identity (see `RATCHET.md` §1):
+///
+/// | Key | Algorithm | Purpose |
+/// |---|---|---|
+/// | `ik_kem` | ML-KEM-1024 static pk | legacy compatibility; second KEM input to bootstrap |
+/// | `ik_x`   | X25519 static pk | DH identity for the bootstrap + ratchet root |
+/// | `sig_pk` | ML-DSA-87 pk | sender authentication (v0.7) |
+/// | `spk_kem` | ML-KEM-1024 signed prekey pk | PQXDH-lite KEM input for session init |
+/// | `spk_x`   | X25519 signed prekey pk | X3DH-lite DH input for session init |
+/// | `spk_sig` | ML-DSA-87 signature over `spk_kem ‖ spk_x` | binds the prekey to the identity |
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IdentityBundle {
+    pub ik_kem: Vec<u8>,
+    pub ik_x: Vec<u8>,
+    pub sig_pk: Vec<u8>,
+    pub spk_kem: Vec<u8>,
+    pub spk_x: Vec<u8>,
+    pub spk_sig: Vec<u8>,
+}
+
+impl IdentityBundle {
+    /// Serializes the bundle. All component sizes are fixed by the algorithm
+    /// constants, so the wire format needs no per-field length prefixes:
+    ///
+    /// ```text
+    /// [1B version 0x09]
+    /// [1568B ik_kem][32B ik_x][2592B sig_pk]
+    /// [1568B spk_kem][32B spk_x][4627B spk_sig]
+    /// ```
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(1 + 2 * KEM_PK_LEN + 2 * X25519_PK_LEN + 2592 + 4627);
+        out.push(IDENTITY_V9_VERSION);
+        out.extend_from_slice(&self.ik_kem);
+        out.extend_from_slice(&self.ik_x);
+        out.extend_from_slice(&self.sig_pk);
+        out.extend_from_slice(&self.spk_kem);
+        out.extend_from_slice(&self.spk_x);
+        out.extend_from_slice(&self.spk_sig);
+        out
+    }
+
+    /// Parses a v0.9 bundle. Legacy v0.7 payloads (KEM + signing key only)
+    /// are also accepted — the prekey fields come back empty — so a profile
+    /// or invite from an older client degrades to "no prekey" instead of
+    /// failing outright (Stage C decides how to treat that).
+    pub fn decode(data: &[u8]) -> Result<IdentityBundle, String> {
+        if data.is_empty() || data[0] != IDENTITY_V9_VERSION {
+            // Legacy v0.7 identity: [2B kem_len][kem][2B sig_len][sig].
+            let (ik_kem, sig_pk) = decode_identity(data)?;
+            return Ok(IdentityBundle {
+                ik_kem,
+                ik_x: Vec::new(),
+                sig_pk,
+                spk_kem: Vec::new(),
+                spk_x: Vec::new(),
+                spk_sig: Vec::new(),
+            });
+        }
+
+        let need = 1 + 2 * KEM_PK_LEN + 2 * X25519_PK_LEN + signing::PUBLIC_KEY_LEN
+            + signing::SIGNATURE_LEN;
+        if data.len() < need {
+            return Err(format!(
+                "v0.9 identity truncated: expected {} bytes, got {}",
+                need,
+                data.len()
+            ));
+        }
+        let mut p = 1;
+        let mut take = |n: usize| -> &[u8] {
+            let s = &data[p..p + n];
+            p += n;
+            s
+        };
+        let ik_kem = take(KEM_PK_LEN).to_vec();
+        let ik_x = take(X25519_PK_LEN).to_vec();
+        let sig_pk = take(signing::PUBLIC_KEY_LEN).to_vec();
+        let spk_kem = take(KEM_PK_LEN).to_vec();
+        let spk_x = take(X25519_PK_LEN).to_vec();
+        let spk_sig = take(signing::SIGNATURE_LEN).to_vec();
+        Ok(IdentityBundle {
+            ik_kem,
+            ik_x,
+            sig_pk,
+            spk_kem,
+            spk_x,
+            spk_sig,
+        })
+    }
+
+    /// True when the bundle carries all v0.9 material (X25519 identity +
+    /// signed prekey + prekey signature). Legacy v0.7-derived bundles are
+    /// incomplete.
+    pub fn is_v9(&self) -> bool {
+        !self.ik_x.is_empty()
+            && !self.spk_kem.is_empty()
+            && !self.spk_x.is_empty()
+            && !self.spk_sig.is_empty()
+    }
+
+    /// Verifies the prekey signature against the identity signing key:
+    /// `spk_sig` must be a valid ML-DSA signature by `sig_pk` over
+    /// `spk_kem ‖ spk_x`. This is what prevents an attacker from substituting
+    /// their own prekey into a victim's profile.
+    pub fn verify_prekey(&self) -> Result<(), String> {
+        if !self.is_v9() {
+            return Err("identity has no signed prekey".to_string());
+        }
+        let mut to_sign = Vec::with_capacity(self.spk_kem.len() + self.spk_x.len());
+        to_sign.extend_from_slice(&self.spk_kem);
+        to_sign.extend_from_slice(&self.spk_x);
+        signing::verify_raw(&self.sig_pk, &to_sign, &self.spk_sig)
+            .map_err(|_| "signed prekey signature does not verify".to_string())
+    }
+}
+
+/// Generates a fresh signed-prekey pair for the given identity keys and
+/// returns the full v0.9 bundle.
+///
+/// The signed prekey is **rotatable**: call this again on re-registration or
+/// prekey rotation and re-publish the bundle. The signature binds the new
+/// prekey to the (unchanged) identity signing key.
+pub fn build_identity_bundle(
+    ik_kem: Vec<u8>,
+    ik_x: Vec<u8>,
+    sig_pk: Vec<u8>,
+    sig_sk: &[u8],
+) -> Result<IdentityBundle, String> {
+    let (spk_kem, _spk_kem_sk) = VurnCipher::generate_keypair();
+    let (spk_x_bytes, _spk_x_sk) = crate::ratchet::x25519_keypair();
+    let spk_x = spk_x_bytes.to_vec();
+
+    let mut to_sign = Vec::with_capacity(spk_kem.len() + spk_x.len());
+    to_sign.extend_from_slice(&spk_kem);
+    to_sign.extend_from_slice(&spk_x);
+    // The signature covers the raw prekey pair; it is carried in the bundle
+    // as a raw ML-DSA signature (no payload framing).
+    let spk_sig = signing::sign_raw(sig_sk, &to_sign)?;
+
+    Ok(IdentityBundle {
+        ik_kem,
+        ik_x,
+        sig_pk,
+        spk_kem,
+        spk_x,
+        spk_sig,
+    })
+}
 
 /// Manages blind username registration, profile lookup, and invite links.
 ///
@@ -111,6 +272,36 @@ impl BlindProfileManager {
         decode_identity(&identity)
     }
 
+    /// Prepares a **v0.9** registration: the profile blob carries the full
+    /// identity bundle (ML-KEM + X25519 identity, ML-DSA signing key, signed
+    /// prekey pair + signature), so a resolver can bootstrap a ratchet
+    /// session from the username alone. Same blind-search properties as
+    /// [`prepare_registration`](Self::prepare_registration).
+    pub fn prepare_registration_v9(
+        username: &str,
+        bundle: &IdentityBundle,
+    ) -> Result<(Vec<u8>, Vec<u8>), String> {
+        let normalized = username.to_lowercase();
+        let search_index = hmac_sha256(normalized.as_bytes(), VURN_SEARCH_SALT)?;
+        let enc_key = derive_encryption_key(&normalized)?;
+        let blob = VurnCipher::encrypt_symmetric(&enc_key, &bundle.encode());
+        Ok((search_index, blob))
+    }
+
+    /// Resolves a **v0.9** profile blob into an [`IdentityBundle`]. Blobs
+    /// registered by older clients (v0.7: KEM + signing key only) resolve too,
+    /// with the prekey fields empty — Stage C decides how to treat a contact
+    /// that cannot bootstrap a ratchet.
+    pub fn resolve_profile_v9(
+        search_username: &str,
+        encrypted_blob: &[u8],
+    ) -> Result<IdentityBundle, String> {
+        let normalized = search_username.to_lowercase();
+        let enc_key = derive_encryption_key(&normalized)?;
+        let identity = VurnCipher::decrypt_symmetric(&enc_key, encrypted_blob)?;
+        IdentityBundle::decode(&identity)
+    }
+
     /// Generates an invite link containing session hash + both public keys.
     ///
     /// Packed format:
@@ -148,6 +339,34 @@ impl BlindProfileManager {
         format!("{}/?invite={}", base, encoded)
     }
 
+    /// Generates a **v0.9** invite: the packed data carries the full identity
+    /// bundle instead of just the KEM + signing keys, so the invitee can
+    /// bootstrap a ratchet session directly from the link.
+    pub fn generate_invite_v9(
+        session_hash: &[u8],
+        bundle: &IdentityBundle,
+        base_url: &str,
+    ) -> String {
+        let identity = bundle.encode();
+        let mut data = Vec::with_capacity(2 + session_hash.len() + identity.len());
+        data.extend_from_slice(&(session_hash.len() as u16).to_le_bytes());
+        data.extend_from_slice(session_hash);
+        data.extend_from_slice(&identity);
+
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&data);
+        let base = base_url.trim_end_matches('/');
+        format!("{}/?invite={}", base, encoded)
+    }
+
+    /// Parses a **v0.9** invite URL into `(session_hash, IdentityBundle)`.
+    /// Legacy v0.7 invites (KEM + signing key only, or even pre-signature
+    /// KEM-only) parse into a bundle with empty prekey/identity fields.
+    pub fn parse_invite_v9(invite_url: &str) -> Result<(Vec<u8>, IdentityBundle), String> {
+        let (session_hash, identity) = Self::parse_invite_raw(invite_url)?;
+        let bundle = IdentityBundle::decode(&identity)?;
+        Ok((session_hash, bundle))
+    }
+
     /// Parses an invite URL back into session hash, KEM public key, and the
     /// ML-DSA sender-verification public key.
     ///
@@ -159,6 +378,29 @@ impl BlindProfileManager {
     /// session hash + KEM key; for those, the returned signing key is empty and
     /// the contact is added as unauthenticated.
     pub fn parse_invite(invite_url: &str) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
+        let (session_hash, identity) = Self::parse_invite_raw(invite_url)?;
+        match decode_identity(&identity) {
+            Ok((public_key, signing_public_key)) => {
+                Ok((session_hash, public_key, signing_public_key))
+            }
+            Err(_) if identity.len() >= 2 => {
+                // Pre-signature legacy invite: bare KEM key only
+                // ([2B kem_len][kem_pk]). Degrade to an unauthenticated
+                // contact instead of failing outright.
+                let kem_len = u16::from_le_bytes([identity[0], identity[1]]) as usize;
+                if identity.len() == 2 + kem_len {
+                    Ok((session_hash, identity[2..].to_vec(), Vec::new()))
+                } else {
+                    Err("Identity payload truncated: missing signing key header".to_string())
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Base64-decodes an invite URL and splits it into `(session_hash,
+    /// identity_payload)` without interpreting the identity format.
+    fn parse_invite_raw(invite_url: &str) -> Result<(Vec<u8>, Vec<u8>), String> {
         let b64 = invite_url
             .split("?invite=")
             .nth(1)
@@ -172,43 +414,13 @@ impl BlindProfileManager {
             return Err("Invite data too short: expected at least 4 header bytes".to_string());
         }
 
-        // Parse session hash length
         let sh_len = u16::from_le_bytes([data[0], data[1]]) as usize;
         let offset = 2 + sh_len;
-
         if data.len() < offset + 2 {
-            return Err("Invite data truncated: missing public key length header".to_string());
+            return Err("Invite data truncated: missing identity payload".to_string());
         }
 
-        // Parse KEM public key length
-        let pk_len = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
-        let kem_end = offset + 2 + pk_len;
-
-        if data.len() < kem_end {
-            return Err(format!(
-                "Invite data truncated: expected {} bytes for public key, got {}",
-                pk_len,
-                data.len() - offset - 2
-            ));
-        }
-
-        let session_hash = data[2..offset].to_vec();
-        let public_key = data[offset + 2..kem_end].to_vec();
-
-        // Parse the ML-DSA signing key if present (v0.7+ invites); legacy
-        // invites that predate signatures carry only the KEM key.
-        let signing_public_key = if data.len() >= kem_end + 2 {
-            let sig_len = u16::from_le_bytes([data[kem_end], data[kem_end + 1]]) as usize;
-            if data.len() >= kem_end + 2 + sig_len {
-                data[kem_end + 2..kem_end + 2 + sig_len].to_vec()
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
-
-        Ok((session_hash, public_key, signing_public_key))
+        Ok((data[2..offset].to_vec(), data[offset..].to_vec()))
     }
 
     /// Generates an SVG QR code for the invite URL.
@@ -600,5 +812,136 @@ mod tests {
         // The base64 crate returns an empty Vec on decode(""), which fails
         // our length check (data.len() < 4)
         assert!(result.is_err(), "Empty invite must fail");
+    }
+
+    // ── v0.9 identity bundle ────────────────────────────────────────────
+
+    fn v9_bundle() -> (IdentityBundle, Vec<u8>) {
+        // Returns the bundle plus the identity signing secret key.
+        let (ik_kem, _) = VurnCipher::generate_keypair();
+        let (ik_x, _) = crate::ratchet::x25519_keypair();
+        let (sig_pk, sig_sk) = crate::signing::generate_signing_keypair();
+        let bundle = build_identity_bundle(ik_kem, ik_x.to_vec(), sig_pk, &sig_sk).unwrap();
+        (bundle, sig_sk)
+    }
+
+    #[test]
+    fn test_v9_bundle_encode_decode_roundtrip() {
+        let (bundle, _sig_sk) = v9_bundle();
+        assert!(bundle.is_v9(), "built bundle must be a full v0.9 identity");
+        assert_eq!(bundle.ik_x.len(), 32, "X25519 identity key must be 32 bytes");
+        assert_eq!(bundle.spk_kem.len(), KEM_PK_LEN);
+        assert_eq!(bundle.spk_x.len(), 32);
+
+        let bytes = bundle.encode();
+        let decoded = IdentityBundle::decode(&bytes).expect("decode roundtrip");
+        assert_eq!(decoded, bundle);
+        assert!(decoded.is_v9());
+        assert!(decoded.verify_prekey().is_ok(), "roundtripped prekey must verify");
+    }
+
+    #[test]
+    fn test_v9_bundle_prekey_signature_binds() {
+        let (bundle, _) = v9_bundle();
+        assert!(bundle.verify_prekey().is_ok());
+
+        // Tampering with the prekey (e.g. an attacker swapping in their own
+        // prekey in a profile) must break the signature check.
+        let mut evil = bundle.clone();
+        let (evil_kem, _) = VurnCipher::generate_keypair();
+        evil.spk_kem = evil_kem;
+        assert!(evil.verify_prekey().is_err(), "swapped prekey must fail verification");
+
+        let mut evil_x = bundle.clone();
+        let (evil_x_pk, _) = crate::ratchet::x25519_keypair();
+        evil_x.spk_x = evil_x_pk.to_vec();
+        assert!(evil_x.verify_prekey().is_err(), "swapped X25519 prekey must fail");
+    }
+
+    #[test]
+    fn test_v9_bundle_rejects_truncation() {
+        let (bundle, _) = v9_bundle();
+        let bytes = bundle.encode();
+        assert!(IdentityBundle::decode(&bytes[..bytes.len() - 1]).is_err());
+        assert!(IdentityBundle::decode(&[]).is_err());
+    }
+
+    #[test]
+    fn test_v9_bundle_decodes_legacy_v07_payload() {
+        // A v0.7 identity payload (KEM + ML-DSA key, no v0.9 magic) must
+        // decode into a bundle with empty prekey fields.
+        let (ik_kem, _) = VurnCipher::generate_keypair();
+        let (sig_pk, _) = crate::signing::generate_signing_keypair();
+        let legacy = encode_identity(&ik_kem, &sig_pk);
+
+        let bundle = IdentityBundle::decode(&legacy).expect("legacy payload must decode");
+        assert_eq!(bundle.ik_kem, ik_kem);
+        assert_eq!(bundle.sig_pk, sig_pk);
+        assert!(!bundle.is_v9(), "legacy-derived bundle must be marked incomplete");
+        assert!(bundle.verify_prekey().is_err());
+    }
+
+    #[test]
+    fn test_v9_registration_resolve_roundtrip() {
+        let (bundle, _) = v9_bundle();
+        let (index, blob) =
+            BlindProfileManager::prepare_registration_v9("Bob", &bundle).expect("register v9");
+        assert_eq!(index.len(), 32);
+
+        let resolved =
+            BlindProfileManager::resolve_profile_v9("bob", &blob).expect("resolve v9");
+        assert_eq!(resolved, bundle);
+        assert!(resolved.verify_prekey().is_ok());
+
+        // Wrong username must fail (AES-GCM auth).
+        assert!(BlindProfileManager::resolve_profile_v9("Eve", &blob).is_err());
+    }
+
+    #[test]
+    fn test_v9_resolve_legacy_blob() {
+        // Blobs registered by a v0.7 client (plain KEM + sig keys) must
+        // resolve through the v9 API into an incomplete bundle.
+        let (pk, _) = VurnCipher::generate_keypair();
+        let (sig_pk, _) = crate::signing::generate_signing_keypair();
+        let (_index, blob) =
+            BlindProfileManager::prepare_registration("Carol", &pk, &sig_pk).expect("legacy register");
+
+        let resolved =
+            BlindProfileManager::resolve_profile_v9("Carol", &blob).expect("v9 resolve of legacy blob");
+        assert_eq!(resolved.ik_kem, pk);
+        assert_eq!(resolved.sig_pk, sig_pk);
+        assert!(!resolved.is_v9());
+    }
+
+    #[test]
+    fn test_v9_invite_roundtrip() {
+        let (bundle, _) = v9_bundle();
+        let hash = vec![0x42u8; 32];
+        let invite =
+            BlindProfileManager::generate_invite_v9(&hash, &bundle, "https://vurnchat.org");
+        assert!(invite.starts_with("https://vurnchat.org/?invite="));
+
+        let (parsed_hash, parsed_bundle) =
+            BlindProfileManager::parse_invite_v9(&invite).expect("parse v9 invite");
+        assert_eq!(parsed_hash, hash);
+        assert_eq!(parsed_bundle, bundle);
+        assert!(parsed_bundle.verify_prekey().is_ok());
+    }
+
+    #[test]
+    fn test_v9_parse_legacy_invite() {
+        // v0.7 invite (KEM + sig keys inside) must parse via the v9 API into
+        // an incomplete bundle.
+        let (pk, _) = VurnCipher::generate_keypair();
+        let (sig_pk, _) = crate::signing::generate_signing_keypair();
+        let hash = VurnCipher::hash_public_key(&pk);
+        let invite = BlindProfileManager::generate_invite(&hash, &pk, &sig_pk, "https://vurnchat.org");
+
+        let (parsed_hash, bundle) =
+            BlindProfileManager::parse_invite_v9(&invite).expect("v9 parse of legacy invite");
+        assert_eq!(parsed_hash, hash);
+        assert_eq!(bundle.ik_kem, pk);
+        assert_eq!(bundle.sig_pk, sig_pk);
+        assert!(!bundle.is_v9());
     }
 }
