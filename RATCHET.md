@@ -216,10 +216,15 @@ ML-DSA-bound via raw signature over `spk_kem ‖ spk_x`),
 and invite generate/parse. Core version bumped to 0.8.0. 51 tests
 green. Stage C (client wiring) still requires re-registration of test
 usernames.
-Stage C: client wiring — per-contact session store in IndexedDB (encrypted),
-send/receive paths use sessions, init on first message to a new contact,
-session persistence across reloads, legacy (v0.7) ciphertext fallback,
-out-of-sync UX.
+Stage C: **core half DONE** (`vurn-core/src/bootstrap.rs`):
+PQXDH-lite initiator/responder root derivation (dh1‖dh2‖dh3‖kem1‖kem2
+order pinned), order-independent session id `SHA-256(sorted(ik_x))`,
+init-envelope framing (bundle + 2 KEM ciphertexts + first package),
+`ratchet::package_sender_key` and public X25519/KEM helpers. 55 core
+tests green. Client half in progress: per-contact session store in
+IndexedDB (encrypted), send/receive paths use sessions, init on first
+message to a new contact, session persistence across reloads, legacy
+(v0.7) ciphertext fallback, out-of-sync UX.
 Stage D: release, build, deploy web + verify two-account E2E.
 
 ## 8. Wire/API surface changes (for Stage C)

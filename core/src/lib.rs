@@ -20,6 +20,7 @@
 //! ```
 
 pub mod identity;
+pub mod bootstrap;
 pub mod ratchet;
 pub mod signing;
 

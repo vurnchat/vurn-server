@@ -152,7 +152,8 @@ fn aead_key(final_mk: &[u8; 32]) -> ([u8; 32], [u8; 12]) {
 
 // ── X25519 helpers ──────────────────────────────────────────────────
 
-fn x25519_shared(sk: &[u8; 32], pk: &[u8; 32]) -> Result<[u8; 32], DecryptError> {
+/// X25519 shared secret (RFC 7748). Exposed for the PQXDH-lite bootstrap.
+pub fn x25519_shared(sk: &[u8; 32], pk: &[u8; 32]) -> Result<[u8; 32], DecryptError> {
     let secret = XStaticSecret::from(*sk);
     let public = XPublicKey::from(*pk);
     let ss = secret.diffie_hellman(&public);
@@ -179,7 +180,8 @@ fn kem_keypair() -> (Vec<u8>, Vec<u8>) {
     )
 }
 
-fn kem_encapsulate(pk: &[u8]) -> Result<(Vec<u8>, Vec<u8>), DecryptError> {
+/// ML-KEM-1024 encapsulation to a public key. Returns `(ciphertext, secret)`.
+pub fn kem_encapsulate(pk: &[u8]) -> Result<(Vec<u8>, Vec<u8>), DecryptError> {
     if pk.len() != KEM_PK_LEN {
         return Err(DecryptError::Malformed);
     }
@@ -191,7 +193,8 @@ fn kem_encapsulate(pk: &[u8]) -> Result<(Vec<u8>, Vec<u8>), DecryptError> {
     Ok((ct.as_slice().to_vec(), ss.as_slice().to_vec()))
 }
 
-fn kem_decapsulate(sk: &[u8], ct: &[u8]) -> Result<Vec<u8>, DecryptError> {
+/// ML-KEM-1024 decapsulation with a secret key. Returns the shared secret.
+pub fn kem_decapsulate(sk: &[u8], ct: &[u8]) -> Result<Vec<u8>, DecryptError> {
     if sk.len() != KEM_SK_LEN || ct.len() != KEM_CT_LEN {
         return Err(DecryptError::Malformed);
     }
@@ -697,6 +700,15 @@ fn parse_header(
         pos += KEM_CT_LEN;
     }
     Ok((flags, pn, n, dh_pub, kem_pk, kem_ct, &pkg[pos..]))
+}
+
+/// Returns the sender's current X25519 ratchet public key carried in a
+/// package header. The responder's PQXDH-lite bootstrap needs it (it is the
+/// initiator's ephemeral key) to compute the DH values that reproduce the
+/// initiator's root.
+pub fn package_sender_key(package: &[u8]) -> Option<[u8; 32]> {
+    let (_, _, _, dh_pub, _, _, _) = parse_header(package).ok()?;
+    Some(dh_pub)
 }
 
 fn aead_encrypt(
