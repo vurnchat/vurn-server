@@ -265,11 +265,12 @@ async fn main() {
     }
 
     // ── 3. Start Mailbox Manager with shared Sled backup ──
-    let mailbox_mgr = MailboxManager::with_db(sled_db);
+    let mailbox_mgr = Arc::new(MailboxManager::with_db(sled_db));
 
     // ── 3. Build WS Gateway State ──
     let ws_state: ws::SharedState = Arc::new(RwLock::new(ws::GatewayStateInner {
         p2p_cmd_tx: Some(p2p_node.cmd_tx.clone()),
+        mailbox: Some(mailbox_mgr.clone()),
         ..Default::default()
     }));
 
@@ -348,21 +349,31 @@ async fn handle_p2p_events(
                 // If topic is present (GossipSub), route to the specific recipient
                 if !topic.is_empty() {
                     if let Ok(recipient_id) = hex::decode(&topic) {
-                        let mut map = ws_state.write().await;
-                        // Clone senders to release immutable borrow before mutable dedup check
-                        let senders = map.clients.get(&recipient_id).cloned();
-                        if let Some(ref senders) = senders {
-                            if ws::check_and_mark_delivered(&mut map.delivered_hashes, &recipient_id, &data) {
-                                info!("GossipSub message from {from} routed to recipient ({} bytes)", data.len());
-                                for tx in senders {
-                                    let _ = tx.send(data.clone());
+                        // Check delivered + forward under one lock, then release it
+                        // before the async persist (write-through watermark).
+                        let was_new = {
+                            let mut map = ws_state.write().await;
+                            let senders = map.clients.get(&recipient_id).cloned();
+                            if let Some(ref senders) = senders {
+                                if ws::check_and_mark_delivered(&mut map.delivered_hashes, &recipient_id, &data) {
+                                    info!("GossipSub message from {from} routed to recipient ({} bytes)", data.len());
+                                    for tx in senders {
+                                        let _ = tx.send(data.clone());
+                                    }
+                                    true
+                                } else {
+                                    trace!("GossipSub: duplicate for {}, dropped", ws::hex_fmt(&recipient_id, 8));
+                                    false
                                 }
                             } else {
-                                trace!("GossipSub: duplicate for {}, dropped", ws::hex_fmt(&recipient_id, 8));
+                                trace!("GossipSub message for {}/{}b — recipient not connected on this node",
+                                    ws::hex_fmt(&recipient_id, 8), data.len());
+                                false
                             }
-                        } else {
-                            trace!("GossipSub message for {}/{}b — recipient not connected on this node",
-                                ws::hex_fmt(&recipient_id, 8), data.len());
+                        };
+                        // Write-through: a restart must not re-deliver this
+                        if was_new {
+                            ws::persist_delivered_set(ws_state, &recipient_id).await;
                         }
                     }
                 } else {
@@ -379,29 +390,57 @@ async fn handle_p2p_events(
                 info!("MailboxRetrieved: {} messages from DHT for {}",
                     messages.len(), ws::hex_fmt(&user_hash, 8));
 
-                let mut all_payloads = mailbox_mgr.handle_retrieval_result(&user_hash, &messages).await;
+                // Records fetched from the DHT (other nodes). Extract verified payloads.
+                let all_payloads = mailbox_mgr.handle_retrieval_result(&user_hash, &messages).await;
 
-                // If DHT returned nothing (no peers, offline), check Sled backup
-                if all_payloads.is_empty() {
-                    let sled_backup = mailbox_mgr.read_and_clear_sled_backup(&user_hash).await;
-                    if !sled_backup.is_empty() {
-                        info!("Sled backup delivered {} offline messages for {}",
-                            sled_backup.len(), ws::hex_fmt(&user_hash, 8));
-                        all_payloads = sled_backup;
+                // Sled is drained instantly on WS connect, so on this event path it's
+                // only a last-resort fallback for records that never made it to the
+                // connected client (e.g. DHT returned nothing but Sled has records).
+                // Anything already in the persisted delivered set is skipped below,
+                // so re-draining cannot cause duplicates.
+                let sled_records = if all_payloads.is_empty() {
+                    let recs = mailbox_mgr.read_sled_backup(&user_hash).await;
+                    if !recs.is_empty() {
+                        info!("Sled backup: {} offline messages for {}",
+                            recs.len(), ws::hex_fmt(&user_hash, 8));
                     }
-                }
+                    recs
+                } else {
+                    vec![]
+                };
 
-                if all_payloads.is_empty() {
+                if all_payloads.is_empty() && sled_records.is_empty() {
                     continue;
                 }
 
-                // Deliver ONLY to the matching user with hash dedup
+                // Deliver ONLY to the matching user with hash dedup.
+                // Deletion from Sled is delete-on-success: records are removed
+                // only once a client actually accepted them (or they duplicate a
+                // message already delivered), never before.
                 let mut map = ws_state.write().await;
-                // Clone senders to release immutable borrow before mutable dedup check
                 let senders = map.clients.get(&user_hash).cloned();
+                let mut to_remove: Vec<Vec<u8>> = vec![];
+                let mut delivered_count = 0usize;
+                let mut dupes = 0usize;
                 if let Some(ref senders) = senders {
-                    let mut delivered_count = 0usize;
-                    let mut dupes = 0usize;
+                    for (key, payload) in &sled_records {
+                        if ws::check_and_mark_delivered(&mut map.delivered_hashes, &user_hash, payload) {
+                            let mut accepted = false;
+                            for tx in senders {
+                                if tx.send(payload.clone()).is_ok() {
+                                    accepted = true;
+                                }
+                            }
+                            if accepted {
+                                delivered_count += 1;
+                                to_remove.push(key.clone());
+                            }
+                            // If not accepted, leave in Sled for the next reconnect
+                        } else {
+                            dupes += 1;
+                            to_remove.push(key.clone());
+                        }
+                    }
                     for payload in &all_payloads {
                         if ws::check_and_mark_delivered(&mut map.delivered_hashes, &user_hash, payload) {
                             for tx in senders {
@@ -412,6 +451,12 @@ async fn handle_p2p_events(
                             dupes += 1;
                         }
                     }
+                    // Persist the exactly-once watermark now that we've delivered
+                    if delivered_count > 0 {
+                        if let Some(hashes) = map.delivered_hashes.get(&user_hash) {
+                            mailbox_mgr.save_delivered_hashes(&user_hash, hashes);
+                        }
+                    }
                     if dupes > 0 {
                         info!("MailboxRetrieved: {} new, {} dupes for {}",
                             delivered_count, dupes, ws::hex_fmt(&user_hash, 8));
@@ -419,6 +464,11 @@ async fn handle_p2p_events(
                 } else {
                     info!("MailboxRetrieved: user {} not connected, kept in Sled backup",
                         ws::hex_fmt(&user_hash, 8));
+                }
+                drop(map);
+                // Delete delivered Sled records AFTER successful delivery
+                if !to_remove.is_empty() {
+                    mailbox_mgr.remove_sled_records(&user_hash, &to_remove).await;
                 }
             }
             NodeEvent::PeerDiscovered(peer_id) => {

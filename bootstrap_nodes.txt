@@ -14,8 +14,8 @@
 #
 # Format: /ip4/<PUBLIC_IP>/tcp/<P2P_PORT>
 
-# Vurn WTFChan — main bootstrap node (VPS, Russia)
+# Vurn WTFChan — main bootstrap node (VPS)
 # P2P port: 9001 (fixed)
 # WS port: 9443 (via socat TLS proxy → localhost:9000)
 # Domain: vurn.wtfchan.lol
-/ip4/87.232.123.7/tcp/9001
+/ip4/31.76.120.213/tcp/9001

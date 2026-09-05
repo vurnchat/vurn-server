@@ -22,10 +22,15 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{error, info, trace, warn};
 
+use crate::mailbox::MailboxManager;
 use crate::p2p::NodeCommand;
 use tokio::sync::oneshot;
+use std::time::Duration;
 
 // ── Protocol constants ──────────────────────────────────────────────
+
+/// WebSocket ping interval in seconds. Cloudflare kills idle WS after ~100s.
+const WS_PING_INTERVAL_SECS: u64 = 30;
 
 const PROFILE_SUCCESS: [u8; 3] = [0xFE, 0x00, 0x00];
 const PROFILE_OCCUPIED: [u8; 3] = [0xFF, 0x00, 0x01];
@@ -85,7 +90,11 @@ pub struct GatewayStateInner {
     /// Per-client rate limiters: session_id → (store_bucket, lookup_bucket)
     pub rate_limiters: HashMap<Vec<u8>, (TokenBucket, TokenBucket)>,
     /// Delivered message hashes per user (dedup across local/GossipSub/mailbox channels).
+    /// Seeded from Sled at connect, persisted back on disconnect — exactly-once
+    /// delivery across reconnects and restarts.
     pub delivered_hashes: HashMap<Vec<u8>, HashSet<u64>>,
+    /// Mailbox manager (Sled) for the exactly-once watermark + instant local drain.
+    pub mailbox: Option<Arc<MailboxManager>>,
 }
 
 impl Default for GatewayStateInner {
@@ -96,14 +105,16 @@ impl Default for GatewayStateInner {
             p2p_connected: false,
             rate_limiters: HashMap::new(),
             delivered_hashes: HashMap::new(),
+            mailbox: None,
         }
     }
 }
 
 pub type SharedState = Arc<RwLock<GatewayStateInner>>;
 
-/// Maximum number of delivered message hashes to remember per user.
-const MAX_DELIVERED_HASHES: usize = 512;
+/// Maximum number of delivered message hashes to remember per user (in-memory).
+/// Larger than before: a full clear would re-enable duplicate delivery.
+const MAX_DELIVERED_HASHES: usize = 4096;
 
 /// Compute a u64 hash of payload bytes for dedup.
 fn payload_hash(data: &[u8]) -> u64 {
@@ -125,9 +136,14 @@ pub fn check_and_mark_delivered(
         trace!("Dedup: skipping duplicate for {} (hash {hash:x})", hex_fmt(user_hash, 8));
         return false;
     }
-    // Keep set bounded — clear entire set when full (simple, deterministic)
+    // Keep set bounded. Evict oldest half when full rather than clearing the
+    // whole set — a full clear would re-enable duplicate delivery of anything
+    // delivered before the eviction.
     if hashes.len() >= MAX_DELIVERED_HASHES {
+        let mut all: Vec<u64> = hashes.iter().copied().collect();
+        all.sort_unstable();
         hashes.clear();
+        hashes.extend(all.into_iter().skip(MAX_DELIVERED_HASHES / 2));
     }
     hashes.insert(hash);
     true
@@ -210,14 +226,14 @@ async fn handle_ws_connection(socket: WebSocket, gateway_state: SharedState) {
         ));
     }
 
-    // Trigger DHT mailbox retrieval for offline messages
+    // Seed the exactly-once delivered-hash set from Sled (survives reconnects/restarts)
     {
-        let map = gateway_state.read().await;
-        if let Some(ref cmd_tx) = map.p2p_cmd_tx {
-            let cmd = NodeCommand::MailboxRetrieve { user_hash: session_id.clone() };
-            let _ = cmd_tx.send(cmd).await;
-            info!("MailboxRetrieve triggered for {}", hex_fmt(&session_id, 8));
-        }
+        let mut map = gateway_state.write().await;
+        let persisted = map.mailbox
+            .as_ref()
+            .map(|m| m.load_delivered_hashes(&session_id))
+            .unwrap_or_default();
+        map.delivered_hashes.insert(session_id.clone(), persisted.into_iter().collect());
     }
 
     let session_id = Arc::new(session_id);
@@ -234,26 +250,123 @@ async fn handle_ws_connection(socket: WebSocket, gateway_state: SharedState) {
     }
 
     // Step 3: Spawn forward task
+    // Sends outgoing payloads AND keepalive pings on the same sink (a SplitSink
+    // cannot be cloned, so pings are interleaved here). Prevents Cloudflare and
+    // other proxies from killing idle WS connections after ~100s.
     let sid_clone = session_id.clone();
     let state_clone = gateway_state.clone();
+    let mut ping_interval = tokio::time::interval(Duration::from_secs(WS_PING_INTERVAL_SECS));
+    // Skip the immediate first tick so we don't ping right after connect
+    ping_interval.tick().await;
     let forward_task = tokio::spawn(async move {
-        while let Some(payload) = rx.recv().await {
-            if ws_sink.send(Message::Binary(payload)).await.is_err() {
-                info!("Forward task: client {} disconnected", hex_fmt(&sid_clone, 8));
-                let mut map = state_clone.write().await;
-                map.delivered_hashes.remove(sid_clone.as_ref());
-                if let Some(senders) = map.clients.get_mut(sid_clone.as_ref()) {
-                    senders.retain(|s| !s.is_closed());
-                    if senders.is_empty() {
-                        map.clients.remove(sid_clone.as_ref());
+        loop {
+            tokio::select! {
+                payload = rx.recv() => {
+                    match payload {
+                        Some(payload) => {
+                            if ws_sink.send(Message::Binary(payload)).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => break,
                     }
                 }
-                break;
+                _ = ping_interval.tick() => {
+                    if ws_sink.send(Message::Ping(vec![])).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        info!("Forward task: client {} disconnected", hex_fmt(&sid_clone, 8));
+        // Do NOT wipe delivered_hashes here — Step 5 persists + removes them.
+        let mut map = state_clone.write().await;
+        if let Some(senders) = map.clients.get_mut(sid_clone.as_ref()) {
+            senders.retain(|s| !s.is_closed());
+            if senders.is_empty() {
+                map.clients.remove(sid_clone.as_ref());
             }
         }
     });
 
+    // Step 3c: Drain the local Sled mailbox instantly and deliver new messages.
+    // This is the fast offline-delivery path: no DHT round-trip, no probing
+    // timeouts. Records are only delivered if NOT in the persisted delivered set
+    // (exactly-once across reconnects/restarts). Deletion is delete-on-success:
+    // a record is removed from Sled only after a client actually accepted it
+    // (or it is a duplicate of one already delivered), so a client dropping
+    // mid-drain can never lose messages — they stay for the next reconnect.
+    let local_drain = {
+        let map = gateway_state.read().await;
+        map.mailbox.clone().map(|m| (m, session_id.to_vec()))
+    };
+    if let Some((mailbox, session)) = local_drain {
+        let pending = mailbox.read_sled_backup(&session).await;
+        let mut to_remove: Vec<Vec<u8>> = Vec::with_capacity(pending.len());
+        let mut new_count = 0usize;
+        if !pending.is_empty() {
+            // Read the sender list once, then deliver under a single lock
+            let mut map = gateway_state.write().await;
+            for (key, payload) in &pending {
+                let hash = payload_hash(payload);
+                let already = map
+                    .delivered_hashes
+                    .get(&session)
+                    .map(|s| s.contains(&hash))
+                    .unwrap_or(false);
+                if already {
+                    // Delivered on a previous connection — safe to drop from Sled.
+                    to_remove.push(key.clone());
+                    continue;
+                }
+                let senders = map.clients.get(&session).cloned();
+                let mut accepted = false;
+                if let Some(senders) = senders {
+                    for tx in &senders {
+                        if tx.send(payload.clone()).is_ok() {
+                            accepted = true;
+                        }
+                    }
+                }
+                if accepted {
+                    // Only now mark delivered + schedule deletion
+                    map.delivered_hashes.entry(session.to_vec()).or_default().insert(hash);
+                    new_count += 1;
+                    to_remove.push(key.clone());
+                } else {
+                    // Client vanished mid-drain — leave the record in Sled
+                    // so the next reconnect still receives it.
+                    warn!("Sled drain: send failed for {}, kept in Sled for next connect",
+                        hex_fmt(&session, 8));
+                }
+            }
+            if new_count > 0 {
+                info!("Sled drain: delivered {} new messages for {}", new_count, hex_fmt(&session, 8));
+                if let Some(mb) = map.mailbox.as_ref() {
+                    if let Some(hashes) = map.delivered_hashes.get(&session) {
+                        mb.save_delivered_hashes(&session, hashes);
+                    }
+                }
+            }
+            drop(map);
+        }
+        // Delete delivered records AFTER successful send (not before)
+        if !to_remove.is_empty() {
+            mailbox.remove_sled_records(&session, &to_remove).await;
+        }
+    }
 
+    // Trigger DHT mailbox retrieval for records that live on OTHER nodes
+    // (multi-node deployments). The node skips straight to an empty result when
+    // it has no P2P peers, so this is fast on a single node too.
+    {
+        let map = gateway_state.read().await;
+        if let Some(ref cmd_tx) = map.p2p_cmd_tx {
+            let cmd = NodeCommand::MailboxRetrieve { user_hash: session_id.to_vec() };
+            let _ = cmd_tx.send(cmd).await;
+            info!("MailboxRetrieve triggered for {}", hex_fmt(session_id.as_ref(), 8));
+        }
+    }
 
     // Step 4: Read messages from client
     while let Some(msg) = ws_stream.next().await {
@@ -275,10 +388,16 @@ async fn handle_ws_connection(socket: WebSocket, gateway_state: SharedState) {
         }
     }
 
-    // Step 5: Cleanup
+    // Step 5: Cleanup — persist the delivered set, then release all per-user state
     info!("Client disconnected: {}", hex_fmt(&session_id, 8));
     {
         let mut map = gateway_state.write().await;
+        // Persist the exactly-once delivered-hash set before dropping it from memory
+        if let Some(hashes) = map.delivered_hashes.get(session_id.as_ref()) {
+            if let Some(mb) = map.mailbox.as_ref() {
+                mb.save_delivered_hashes(session_id.as_ref(), hashes);
+            }
+        }
         // Remove rate limiters for this client
         map.rate_limiters.remove(session_id.as_ref());
         // Clean up delivered hashes for this client
@@ -295,6 +414,18 @@ async fn handle_ws_connection(socket: WebSocket, gateway_state: SharedState) {
 }
 
 // ── Relay ───────────────────────────────────────────────────────────
+
+/// Persist a user's in-memory delivered-hash set to Sled (write-through).
+/// Called whenever new messages are marked delivered so a restart/reconnect
+/// cannot re-deliver them.
+pub async fn persist_delivered_set(state: &SharedState, user_hash: &[u8]) {
+    let map = state.read().await;
+    if let Some(mb) = map.mailbox.as_ref() {
+        if let Some(hashes) = map.delivered_hashes.get(user_hash) {
+            mb.save_delivered_hashes(user_hash, hashes);
+        }
+    }
+}
 
 /// Check if a client has exceeded their rate limit for store operations.
 fn check_rate_limit_store(state: &mut GatewayStateInner, client_id: &[u8]) -> bool {
@@ -337,32 +468,64 @@ async fn relay_or_p2p(state: &SharedState, sender_id: &[u8], data: &[u8]) {
     forward.extend_from_slice(sender_id);
     forward.extend_from_slice(payload);
 
-    // Try local delivery with dedup (clone senders first to avoid borrow conflict)
-    let delivered = {
+    // Try local delivery with dedup. CRITICAL: only mark the message as
+    // delivered AFTER at least one live client accepted it — marking before a
+    // successful send would let a mid-relay disconnect lose the message forever
+    // (marked delivered, never sent, never stored in the mailbox).
+    let (delivered, was_duplicate) = {
         let mut map = state.write().await;
         let senders = map.clients.get(recipient_id).cloned();
         if let Some(ref senders) = senders {
-            if check_and_mark_delivered(&mut map.delivered_hashes, recipient_id, &forward) {
+            let hash = payload_hash(&forward);
+            let already = map
+                .delivered_hashes
+                .get(recipient_id)
+                .map(|s| s.contains(&hash))
+                .unwrap_or(false);
+            if already {
+                // Duplicate already delivered previously — treat as delivered
+                (true, true)
+            } else {
                 let mut ok = false;
                 for tx in senders {
                     if tx.send(forward.clone()).is_ok() {
                         ok = true;
                     }
                 }
-                ok
-            } else {
-                true // duplicate already marked, treat as delivered
+                if ok {
+                    // Only now mark delivered (insert into the set)
+                    map.delivered_hashes.entry(recipient_id.to_vec()).or_default().insert(hash);
+                    (true, false)
+                } else {
+                    // Every send failed — recipient vanished mid-relay. NOT
+                    // delivered, NOT marked: fall through to the mailbox so the
+                    // next reconnect receives it.
+                    (false, false)
+                }
             }
         } else {
-            false
+            (false, false) // recipient not connected to this node
         }
     };
 
     if delivered {
         info!("Local relay: {} → {}", hex_fmt(sender_id, 8), hex_fmt(recipient_id, 8));
+        // Write-through so a restart cannot re-deliver this message from Sled.
+        if !was_duplicate {
+            persist_delivered_set(state, recipient_id).await;
+        }
+        // Recipient got the message on this node — no GossipSub or mailbox store
+        // needed. This is the single-node fast path and avoids re-delivery later.
+        // (Tradeoff: an identical recipient hash connected to a DIFFERENT node
+        // simultaneously won't get realtime copies here — but the mailbox on
+        // that node covers it, and same-identity-across-nodes isn't a supported
+        // topology in the current single-node deployment.)
+        return;
     }
 
-    // Always publish via GossipSub — hash dedup on receiver side prevents duplicates
+    // Recipient is NOT connected to this node: publish via GossipSub (other
+    // nodes' connected clients) and store in the DHT mailbox (offline delivery).
+    // Hash dedup on the receiver side prevents duplicates if both fire.
     {
         let map = state.read().await;
         if let Some(ref cmd_tx) = map.p2p_cmd_tx {

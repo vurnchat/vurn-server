@@ -961,6 +961,11 @@ async fn handle_command(
     pending_profile_queries: &mut HashMap<kad::QueryId, oneshot::Sender<Option<Vec<u8>>>>,
     sled_db: &sled::Db,
 ) -> MailboxState {
+    // Whether this node currently has any P2P peers. When it has none (fresh or
+    // solo node), the DHT is unusable for storage — the local Sled backup is the
+    // durable store — so we skip DHT probing entirely and operate on Sled only.
+    let has_peers = swarm.connected_peers().next().is_some();
+
     let NodeBehaviour {
         ref mut kademlia,
         ref mut gossipsub,
@@ -989,6 +994,21 @@ async fn handle_command(
                 store_signed_envelope(kademlia, &recipient_hash, &sender_hash, &payload, new_index, signing_key, mailbox_indices, sled_db);
                 info!("MailboxStore (fast): signed seq {new_index} for {}",
                     hex_fmt(&recipient_hash, 8));
+                return mailbox_state;
+            }
+
+            // No peers → the DHT can't answer probes. Use the local Sled max
+            // seq (persistent across restarts) as the next index and store
+            // straight to Sled instantly. NEVER hardcode seq 1 — Sled keys are
+            // [user_hash || seq], so a fixed seq would overwrite every previous
+            // offline message for this recipient.
+            if !has_peers {
+                let next_seq = get_sled_max_seq(sled_db, &recipient_hash)
+                    .map(|s| s + 1)
+                    .unwrap_or(1);
+                info!("MailboxStore (solo): no peers, storing seq {next_seq} for {}",
+                    hex_fmt(&recipient_hash, 8));
+                store_signed_envelope(kademlia, &recipient_hash, &sender_hash, &payload, next_seq, signing_key, mailbox_indices, sled_db);
                 return mailbox_state;
             }
 
@@ -1038,6 +1058,15 @@ async fn handle_command(
             if !mailbox_state.is_idle() {
                 warn!("MailboxRetrieve: previous operation still in progress, dropping");
                 return mailbox_state;
+            }
+
+            // No peers → no DHT records to fetch. Sled is drained separately by
+            // the WS gateway on connect (instant local delivery). Emit empty so
+            // the client's exactly-once drain is the only delivery path.
+            if !has_peers {
+                info!("MailboxRetrieve (solo): no peers, Sled drain handles {}",
+                    hex_fmt(&user_hash, 8));
+                return emit_empty_mailbox(user_hash, ev_tx).await;
             }
 
             if let Some(&index) = mailbox_indices.get(&user_hash) {

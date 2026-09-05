@@ -1,6 +1,6 @@
 [package]
 name = "vurn-server"
-version = "0.6.5"
+version = "0.6.6"
 edition = "2021"
 description = "Blind WebSocket relay server for the VurnChat messenger"
 license = "MIT OR Apache-2.0"
