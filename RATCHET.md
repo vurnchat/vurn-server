@@ -216,16 +216,26 @@ ML-DSA-bound via raw signature over `spk_kem ‖ spk_x`),
 and invite generate/parse. Core version bumped to 0.8.0. 51 tests
 green. Stage C (client wiring) still requires re-registration of test
 usernames.
-Stage C: **core half DONE** (`vurn-core/src/bootstrap.rs`):
-PQXDH-lite initiator/responder root derivation (dh1‖dh2‖dh3‖kem1‖kem2
-order pinned), order-independent session id `SHA-256(sorted(ik_x))`,
-init-envelope framing (bundle + 2 KEM ciphertexts + first package),
-`ratchet::package_sender_key` and public X25519/KEM helpers. 55 core
-tests green. Client half in progress: per-contact session store in
-IndexedDB (encrypted), send/receive paths use sessions, init on first
-message to a new contact, session persistence across reloads, legacy
-(v0.7) ciphertext fallback, out-of-sync UX.
-Stage D: release, build, deploy web + verify two-account E2E.
+Stage C: **DONE.** Core half: `vurn-core/src/bootstrap.rs` — PQXDH-lite
+initiator/responder root derivation (dh1‖dh2‖dh3‖kem1‖kem2 order
+pinned), order-independent session id `SHA-256(sorted(ik_x))`, init
+envelope framing, `ratchet::package_sender_key`, public X25519/KEM
+helpers (59 core tests green). Client half (deployed): per-contact
+session store encrypted in IndexedDB, ratchet send/receive paths with
+init on first message to a contact, legacy v0.7 fallback (payload type
+tags 0x01/0x02/0x03 — legacy packages start 0x20, no collision),
+init-envelope identity check (must match the stored contact bundle or
+the message is rejected as possible impersonation), TOFU bundle
+adoption for hex-added contacts, out-of-sync UX with a re-establish
+action that sends a fresh init, auto-clear of the desync banner.
+Stage D: **DONE.** Web deployed to `vurn-web.pages.dev`; node restarted
+(stale v0.7 profiles cleared); two-account headless E2E passed all 14
+checks: profile creation (v9), username registration, add-by-username,
+first message as ratchet init, reply as continuation, second message on
+the established session, and a reload mid-conversation proving session
+state persists in encrypted IndexedDB. Both clients must update
+together; existing profiles need a one-time reset + username
+re-registration.
 
 ## 8. Wire/API surface changes (for Stage C)
 
