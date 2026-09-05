@@ -20,6 +20,7 @@
 //! ```
 
 pub mod identity;
+pub mod ratchet;
 pub mod signing;
 
 use aes_gcm::{
