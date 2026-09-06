@@ -80,6 +80,14 @@ pub struct IdentityBundle {
 }
 
 impl IdentityBundle {
+    /// Whether two bundles represent the **same identity**: identical static
+    /// identity keys (`ik_kem`, `ik_x`, `sig_pk`). The signed prekey is
+    /// *rotatable* and may legitimately differ between two bundles of the
+    /// same user (RATCHET.md §1), so it is excluded from the comparison.
+    pub fn same_identity(&self, other: &IdentityBundle) -> bool {
+        self.ik_kem == other.ik_kem && self.ik_x == other.ik_x && self.sig_pk == other.sig_pk
+    }
+
     /// Serializes the bundle. All component sizes are fixed by the algorithm
     /// constants, so the wire format needs no per-field length prefixes:
     ///
@@ -205,6 +213,52 @@ pub fn build_identity_bundle(
         spk_kem,
         spk_x,
         spk_sig,
+    })
+}
+
+/// Result of rotating a signed prekey: the new public bundle **plus** the
+/// new secret halves (so the client can persist them for responder-side
+/// decapsulation of future inits).
+pub struct RotatedPrekey {
+    /// The new public bundle with the fresh signed prekey.
+    pub bundle: IdentityBundle,
+    /// Fresh ML-KEM-1024 signed-prekey secret key.
+    pub spk_kem_sk: Vec<u8>,
+    /// Fresh X25519 signed-prekey secret key.
+    pub spk_x_sk: Vec<u8>,
+}
+
+/// Rotates the signed prekey of an existing identity: the static identity
+/// keys (`ik_kem`, `ik_x`, `sig_pk`) are unchanged, a fresh `spk_kem`/`spk_x`
+/// pair is generated and bound to the identity by a new `spk_sig` from the
+/// *same* identity ML-DSA key. Callers re-publish the returned bundle (e.g.
+/// via the server's profile-update opcode) and keep the previous prekey
+/// secrets until in-flight sessions that used them are closed.
+pub fn rotate_signed_prekey(
+    ik_kem: Vec<u8>,
+    ik_x: Vec<u8>,
+    sig_pk: Vec<u8>,
+    sig_sk: &[u8],
+) -> Result<RotatedPrekey, String> {
+    let (spk_kem, spk_kem_sk) = VurnCipher::generate_keypair();
+    let (spk_x, spk_x_sk) = crate::ratchet::x25519_keypair();
+
+    let mut to_sign = Vec::with_capacity(spk_kem.len() + spk_x.len());
+    to_sign.extend_from_slice(&spk_kem);
+    to_sign.extend_from_slice(&spk_x);
+    let spk_sig = signing::sign_raw(sig_sk, &to_sign)?;
+
+    Ok(RotatedPrekey {
+        bundle: IdentityBundle {
+            ik_kem,
+            ik_x,
+            sig_pk,
+            spk_kem: spk_kem.to_vec(),
+            spk_x: spk_x.to_vec(),
+            spk_sig,
+        },
+        spk_kem_sk,
+        spk_x_sk: spk_x_sk.to_vec(),
     })
 }
 
@@ -943,5 +997,101 @@ mod tests {
         assert_eq!(bundle.ik_kem, pk);
         assert_eq!(bundle.sig_pk, sig_pk);
         assert!(!bundle.is_v9());
+    }
+
+    // ── Prekey rotation ────────────────────────────────────────────────
+
+    #[test]
+    fn test_rotate_prekey_keeps_identity_and_binds() {
+        // Rotation replaces the prekey but keeps ik_kem/ik_x/sig_pk and the
+        // new prekey is bound to the *same* identity signing key.
+        let (bundle, sig_sk) = v9_bundle();
+        let old_bundle = bundle.clone();
+
+        let rotated = rotate_signed_prekey(
+            bundle.ik_kem.clone(),
+            bundle.ik_x.clone(),
+            bundle.sig_pk.clone(),
+            &sig_sk,
+        )
+        .expect("rotate");
+
+        // Same identity, different prekey.
+        assert!(bundle.same_identity(&rotated.bundle));
+        assert_eq!(bundle.sig_pk, rotated.bundle.sig_pk);
+        assert_eq!(bundle.ik_x, rotated.bundle.ik_x);
+        assert_eq!(bundle.ik_kem, rotated.bundle.ik_kem);
+        assert_ne!(bundle.spk_kem, rotated.bundle.spk_kem, "prekey must change");
+        assert_ne!(bundle.spk_x, rotated.bundle.spk_x, "prekey must change");
+        assert_ne!(bundle.spk_sig, rotated.bundle.spk_sig);
+
+        // New prekey verifies against the unchanged identity key.
+        assert!(rotated.bundle.verify_prekey().is_ok());
+        assert!(rotated.bundle.is_v9());
+
+        // Secret halves returned for responder persistence.
+        assert_eq!(rotated.spk_kem_sk.len(), crate::ratchet::KEM_SK_LEN);
+        assert_eq!(rotated.spk_x_sk.len(), 32);
+
+        // Old bundle's prekey still verifies (it was validly signed before),
+        // and the two bundles are distinct encodings of the same identity.
+        assert!(old_bundle.verify_prekey().is_ok());
+        assert_ne!(bundle.encode(), rotated.bundle.encode());
+    }
+
+    #[test]
+    fn test_same_identity_ignores_prekey() {
+        let (bundle, sig_sk) = v9_bundle();
+        let rotated = rotate_signed_prekey(
+            bundle.ik_kem.clone(),
+            bundle.ik_x.clone(),
+            bundle.sig_pk.clone(),
+            &sig_sk,
+        )
+        .unwrap();
+
+        assert!(bundle.same_identity(&rotated.bundle));
+
+        // A different identity must NOT compare equal.
+        let (other, _) = v9_bundle();
+        assert!(!bundle.same_identity(&other));
+
+        // Rotated bundle still routes to the same identity hash (ik_kem unchanged).
+        assert_eq!(
+            VurnCipher::hash_public_key(&bundle.ik_kem),
+            VurnCipher::hash_public_key(&rotated.bundle.ik_kem)
+        );
+    }
+
+    #[test]
+    fn test_rotated_bundle_resolves_under_same_username() {
+        // The rotation flow re-publishes the *new* bundle under the same
+        // username; a resolver must get the rotated prekey, still bound to
+        // the same identity.
+        let (bundle, sig_sk) = v9_bundle();
+        let rotated = rotate_signed_prekey(
+            bundle.ik_kem.clone(),
+            bundle.ik_x.clone(),
+            bundle.sig_pk.clone(),
+            &sig_sk,
+        )
+        .unwrap();
+
+        let (_idx1, blob1) =
+            BlindProfileManager::prepare_registration_v9("PrekeyBob", &bundle).unwrap();
+        let (_idx2, blob2) =
+            BlindProfileManager::prepare_registration_v9("PrekeyBob", &rotated.bundle).unwrap();
+        // Same username → same search index, different blob.
+        assert_eq!(idx_to_hex(&_idx1), idx_to_hex(&_idx2));
+
+        let resolved =
+            BlindProfileManager::resolve_profile_v9("PrekeyBob", &blob2).expect("resolve");
+        assert_eq!(resolved, rotated.bundle);
+        assert!(resolved.verify_prekey().is_ok());
+        assert!(bundle.same_identity(&resolved));
+    }
+
+    fn idx_to_hex(idx: &[u8]) -> String {
+        idx.iter().map(|b| format!("{:02x}", b)).collect()
     }
 }
