@@ -457,14 +457,22 @@ impl Session {
     /// length of the chain we were receiving — anything we have not consumed
     /// was lost in transit and its keys are retained) and with `until = n`
     /// when a gap opens inside the current chain. Advances `n_r` so the next
-    /// in-order message is `until`. A gap wider than [`MAX_SKIP`] (or a store
-    /// already at [`MAX_SKIPPED_TOTAL`]) is a hard `OutOfOrder` — it caps the
-    /// work and memory a hostile relay can force.
+    /// in-order message is `until`. A gap wider than [`MAX_SKIP`], or a gap
+    /// that would push the store past [`MAX_SKIPPED_TOTAL`], is a hard
+    /// `OutOfOrder` rejected *up front, before any state changes* — it caps
+    /// the work and memory a hostile relay can force without risking a
+    /// partially-advanced chain.
     fn skip_to(&mut self, until: u32) -> Result<(), DecryptError> {
         if until <= self.n_r {
             return Ok(());
         }
         if until - self.n_r > MAX_SKIP {
+            return Err(DecryptError::OutOfOrder);
+        }
+        // Store capacity is checked up front so a rejection is atomic: a
+        // partial skip (keys inserted, `n_r` advanced, chain key not) would
+        // leave the receiving chain inconsistent and brick the session.
+        if self.skipped.len() + (until - self.n_r) as usize > MAX_SKIPPED_TOTAL {
             return Err(DecryptError::OutOfOrder);
         }
         // No receiving chain open for this peer key yet (e.g. a new chain
@@ -480,9 +488,6 @@ impl Session {
         };
         while self.n_r < until {
             let (mk, next) = chain_step(&ck);
-            if self.skipped.len() >= MAX_SKIPPED_TOTAL {
-                return Err(DecryptError::OutOfOrder);
-            }
             self.skipped.insert((dh, self.n_r), mk);
             ck = next;
             self.n_r += 1;
@@ -1281,5 +1286,56 @@ mod tests {
         // The conversation continues on A2.
         let a4 = alice.encrypt(b"a4").unwrap();
         assert_eq!(bob.decrypt(&a4).unwrap(), b"a4");
+    }
+
+    /// Filling the skipped store to its cap must not corrupt chain state when
+    /// the *next* gap would overflow it: the whole gap is rejected up front
+    /// (no partial advance of `n_r`, no stray store entries, chain key
+    /// untouched), and the missing in-order message still decrypts.
+    #[test]
+    fn test_store_capacity_rejected_atomically() {
+        let (mut alice, mut bob) = fixture();
+
+        // Deliver messages 0, 2, 4, …, 3998: each even message opens a
+        // one-message gap whose key is retained, so the store fills to
+        // MAX_SKIPPED_TOTAL - 1 = 1999 keys and n_r = 3999.
+        let total = MAX_SKIPPED_TOTAL - 1;
+        let last_even = 2 * total; // 3998
+        let pkgs: Vec<Vec<u8>> = (0..=last_even + 3)
+            .map(|i| alice.encrypt(format!("cap-{}", i).as_bytes()).unwrap())
+            .collect();
+        assert_eq!(bob.decrypt(&pkgs[0]).unwrap(), b"cap-0");
+        for k in 1..=total {
+            let idx = 2 * k; // message number 2k
+            assert_eq!(
+                bob.decrypt(&pkgs[idx]).unwrap(),
+                format!("cap-{}", idx).as_bytes()
+            );
+        }
+        assert_eq!(bob.skipped.len(), total);
+        assert_eq!(bob.n_r, last_even as u32 + 1);
+
+        // Message 4001 opens a gap of 2: 2001 keys would be needed, over the
+        // cap. Rejected with no state change at all.
+        let (n_r_before, store_before, ck_before) = (bob.n_r, bob.skipped.len(), bob.ck_r);
+        assert_eq!(
+            bob.decrypt(&pkgs[last_even + 3]).unwrap_err(),
+            DecryptError::OutOfOrder
+        );
+        assert_eq!((bob.n_r, bob.skipped.len()), (n_r_before, store_before));
+        assert_eq!(bob.ck_r, ck_before);
+
+        // The chain is consistent: the next in-order message (3999) decrypts,
+        // and a retained straggler (3997) decrypts from the store and is
+        // removed — the store was never damaged by the rejected gap.
+        assert_eq!(
+            bob.decrypt(&pkgs[last_even + 1]).unwrap(),
+            format!("cap-{}", last_even + 1).as_bytes()
+        );
+        assert_eq!(
+            bob.decrypt(&pkgs[last_even - 1]).unwrap(),
+            format!("cap-{}", last_even - 1).as_bytes()
+        );
+        assert_eq!(bob.skipped.len(), total - 1);
     }
 }
