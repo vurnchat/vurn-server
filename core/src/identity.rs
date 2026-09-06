@@ -1077,7 +1077,7 @@ mod tests {
         )
         .unwrap();
 
-        let (_idx1, blob1) =
+        let (_idx1, _blob1) =
             BlindProfileManager::prepare_registration_v9("PrekeyBob", &bundle).unwrap();
         let (_idx2, blob2) =
             BlindProfileManager::prepare_registration_v9("PrekeyBob", &rotated.bundle).unwrap();

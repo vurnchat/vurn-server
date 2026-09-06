@@ -98,11 +98,20 @@ decrypt (the initiator's ephemeral key only appears in that first inbound
 header) and pre-generates a KEM ratchet key at session start, because the
 initiator encapsulates to it from her very first message.
 
-Skipped-message-key store: none initially. We rely on the relay's ordered,
-exactly-once delivery (v0.6.6 watermark + Sled drain). A gap or out-of-order
-message is a hard protocol error that surfaces as a "session out of sync"
-notice; recovery = the peer starts a new session (fresh init). Documented
-limitation, revisit if multi-node DHT replication makes reordering plausible.
+Skipped-message-key store: yes (Stage G). Each side retains message keys
+for messages it jumps over in a receiving chain (Signal `MKSK`), keyed by
+the sender's chain ratchet key and message number: a message with `n`
+ahead of the chain's counter triggers a key derivation for the skipped
+range (`≤ MAX_SKIP = 1000` per gap, `≤ MAX_SKIPPED_TOTAL = 2000` stored),
+and a late/out-of-order message decrypts from the store without touching
+ratchet state. When a peer opens a new chain whose `pn` exceeds what we
+consumed of its predecessor (loss), the missing tail's keys are retained
+before the DH ratchet, so stragglers still decrypt. A number that is
+neither next-in-chain nor in the store stays a hard `OutOfOrder`
+(duplicate/replay/oversized gap). Store entries are deleted only after a
+successful AEAD open and serialize with the session state (session format
+0x0B; 0x0A blobs still load with an empty store, the wire format is
+unchanged).
 
 ## 4. Message flow (double ratchet, DH + KEM mixing)
 
@@ -126,15 +135,24 @@ Receive (peer→we), Signal RatchetDecrypt extended:
 1. First message ever (responder): derive the initial root + receiving chain
    from `dh = X25519(session-start sk, header.dh)` — the initiator derived
    the same value for her first sending chain.
-2. If `header.dh != dh_peer`: peer opened a new chain. Validate `header.pn ==
-   n_recv` (their previous chain fully consumed); `dh = X25519(dh_our.sk,
-   header.dh)`; root_step → new receiving chain; `n_recv = 0`; adopt
-   `dh_peer = header.dh`; clear the sending chain (reopened on next send).
-   If `header.dh == dh_peer`: require `header.n == n_recv` (ordered,
-   exactly-once), else `OutOfOrder`.
-3. Advance `ck_recv`, derive `mk`; decapsulate the header KEM ciphertext
+2. Before anything else, check the skipped-message-key store for
+   `(header.dh, header.n)`: a hit means a late/out-of-order message whose
+   key we retained — decrypt from the store (delete the entry only after a
+   successful AEAD open) and stop.
+3. If `header.dh != dh_peer`: peer opened a new chain. Validate `header.pn
+   >= n_recv` (it can never report fewer than we consumed); if it is
+   larger, retain the skipped keys for the lost tail `[n_recv, pn)` of the
+   chain we were receiving (`SkipMessageKeys`, bounded by MAX_SKIP); then
+   `dh = X25519(dh_our.sk, header.dh)`; root_step → new receiving chain;
+   `n_recv = 0`; adopt `dh_peer = header.dh`; clear the sending chain
+   (reopened on next send). If `header.dh == dh_peer` and `header.n >
+   n_recv`: retain skipped keys `[n_recv, header.n)` and continue in order.
+   If `header.n < n_recv` (and not in the store): duplicate/replay →
+   `OutOfOrder`.
+4. Advance `ck_recv`, derive `mk`; decapsulate the header KEM ciphertext
    with the advertised KEM secret keys (newest first); `final_mk`;
-   AEAD-decrypt. On success record the peer's freshly advertised `kem_pk`.
+   AEAD-decrypt. On success record the peer's freshly advertised `kem_pk`
+   (in-order path only — a straggler must not regress our view).
 
 Note (SPQR layering): we implement per-message KEM mixing (formulation (b));
 it costs one 1568-byte KEM ciphertext per message on the wire. If message
@@ -261,6 +279,19 @@ a hex-added contact authenticates from its very first message. E2E
 re-run with fresh profiles: all 14 checks pass, including the
 "no ⚠ unverified marker" assertions on both the init and the
 continuation. Both clients must update together.
+Stage G: **DONE.** Skipped-message-key store in `vurn-core/src/ratchet.rs`
+(core 0.11.0). Receivers no longer hard-drop reordered/lost messages:
+gaps inside a chain and loss across a chain switch trigger a bounded
+`SkipMessageKeys`-style retention (`MAX_SKIP = 1000` per gap,
+`MAX_SKIPPED_TOTAL = 2000` per session) keyed by `(dh_pub, n)`, and late
+messages decrypt from the store without disturbing ratchet state.
+Entries are deleted only after a successful AEAD open (a forged replay
+cannot burn a genuine key) and serialize with the session (state format
+0x0B; 0x0A blobs load with an empty store, wire format unchanged, so
+clients do not need to be co-deployed for this stage). 63 core tests
+green, including scrambled within-chain delivery, forged-open survival,
+store persistence across serialize/restore, an over-MAX_SKIP gap that
+must not damage chain state, and lost-tail-across-chain-switch recovery.
 Stage F: **DONE.** Signed-prekey rotation (core + web, deployed). Core
 0.10.0 adds `rotate_signed_prekey` (fresh KEM+X25519 prekey bound to the
 unchanged identity signing key, returns the new bundle + secret halves)

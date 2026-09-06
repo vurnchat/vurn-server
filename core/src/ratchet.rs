@@ -15,11 +15,15 @@
 //! ## Delivery model
 //!
 //! The relay delivers messages per conversation in order, exactly once
-//! (server-side watermark + Sled drain, v0.6.6). The engine therefore does
-//! **not** implement Signal's skipped-message-key store: a message number
-//! that does not match the expected next number for its chain is a hard
-//! error (`Err(OutOfOrder)`). Both sides keep at most two advertised KEM
-//! secrets to tolerate crossed messages (lag ≤ 1 chain).
+//! (server-side watermark + Sled drain, v0.6.6), but the engine no longer
+//! *relies* on it: a **skipped-message-key store** (Signal `MKSK`) lets a
+//! receiver derive and retain message keys for the messages it jumps over
+//! (within [`MAX_SKIP`] of a gap, keyed by the sending chain's DH key and
+//! message number). Out-of-order messages — including stragglers of a
+//! chain the peer already advanced past — decrypt from the store instead of
+//! erroring, and loss only costs the lost messages themselves. A number
+//! that is neither the expected next nor in the store stays a hard
+//! `Err(OutOfOrder)` (duplicate/replay).
 //!
 //! ## Package layout
 //!
@@ -49,6 +53,7 @@ use ml_kem::{
 };
 use rand::rngs::OsRng;
 use sha2::Sha256;
+use std::collections::BTreeMap;
 use x25519_dalek::{PublicKey as XPublicKey, StaticSecret as XStaticSecret};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -62,7 +67,20 @@ pub const KEM_SK_LEN: usize = 3168;
 /// KEM ciphertext size.
 pub const KEM_CT_LEN: usize = 1568;
 
+/// Wire package version (every message header). Unchanged by the message-key
+/// store — the wire format is identical.
 const PKG_VERSION: u8 = 0x0A;
+/// Serialized *session-state* version. 0x0B adds the skipped-message-key
+/// store; 0x0A (legacy) is still accepted by `from_bytes` (empty store).
+const SESSION_VERSION: u8 = 0x0B;
+/// Maximum gap the store will bridge in one skip (Signal `MAX_SKIP`). A
+/// larger gap is treated as out of order / malicious rather than forcing a
+/// multi-thousand-step key derivation.
+pub const MAX_SKIP: u32 = 1000;
+/// Hard cap on stored skipped message keys per session (32 bytes each).
+/// Bounds memory for an attacker that drives many skips; legitimate
+/// conversations stay far below it.
+pub const MAX_SKIPPED_TOTAL: usize = 2000;
 const FLAG_DH: u8 = 0x01;
 const FLAG_KEM_PK: u8 = 0x02;
 const FLAG_KEM_CT: u8 = 0x04;
@@ -85,8 +103,9 @@ const LBL_NONCE: u8 = 0x07; // HMAC(mk, 0x07)[0..12] — AEAD nonce
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecryptError {
     Malformed,
-    /// Message number is not the expected next number for its chain
-    /// (gap, duplicate, or replay under the ordered-delivery model).
+    /// Message number is neither the expected next number for its chain nor
+    /// present in the skipped-message-key store (duplicate, replay, or a
+    /// gap beyond [`MAX_SKIP`]).
     OutOfOrder,
     /// No session state / missing sending chain for this role yet.
     NoState,
@@ -242,6 +261,12 @@ pub struct Session {
     pub kem_peer: Option<Vec<u8>>,
     /// Set when we must advertise a fresh ML-KEM key on the next send.
     advertise_kem_next: bool,
+    /// Skipped-message-key store (Signal `MKSK`): message keys derived when
+    /// we jumped over a message of a receiving chain, keyed by the *peer's*
+    /// sending-chain ratchet key (`dh_pub` in the message header) and the
+    /// message number. Lets out-of-order and delayed messages decrypt
+    /// without erroring. Serialized with the session state.
+    pub skipped: BTreeMap<([u8; 32], u32), [u8; 32]>,
     /// True once the receiving chain for the peer's first message has been
     /// derived. The initiator derives it in [`Session::start_alice`]; the
     /// responder derives it on first decrypt, when the initiator's ephemeral
@@ -289,6 +314,7 @@ impl Session {
             kem_advertised: Vec::new(),
             kem_peer: None,
             advertise_kem_next: true,
+            skipped: BTreeMap::new(),
             initialized: true, // nothing to receive from the responder yet, but init is done
         };
         // First sending chain: DH between our session-start (X3DH ephemeral)
@@ -334,6 +360,7 @@ impl Session {
             kem_advertised: vec![AdvertisedKem { pk: kem_pk, sk: kem_sk }],
             kem_peer: None,
             advertise_kem_next: true,
+            skipped: BTreeMap::new(),
             initialized: false,
         }
     }
@@ -422,41 +449,62 @@ impl Session {
         Ok(out)
     }
 
-    /// Decrypts a package. Ratchets state forward on new peer ratchet keys.
-    pub fn decrypt(&mut self, package: &[u8]) -> Result<Vec<u8>, DecryptError> {
-        let (flags, pn, n, dh_pub, kem_pk, kem_ct, rest) = parse_header(package)?;
-        let ct = rest;
-
-        // Responder, very first inbound message: the header finally reveals
-        // the initiator's session-start (ephemeral) key. Derive the shared
-        // initial root + first receiving chain exactly as the initiator did.
-        if !self.initialized {
-            self.derive_initial_receive_chain(dh_pub)?;
+    /// Derives and stores message keys for messages `[n_r, until)` of the
+    /// *current* receiving chain (Signal `SkipMessageKeys`), so that messages
+    /// which arrive late still decrypt from the skipped-message-key store.
+    ///
+    /// Called with `until = pn` when the peer opens a new chain (pn is the
+    /// length of the chain we were receiving — anything we have not consumed
+    /// was lost in transit and its keys are retained) and with `until = n`
+    /// when a gap opens inside the current chain. Advances `n_r` so the next
+    /// in-order message is `until`. A gap wider than [`MAX_SKIP`] (or a store
+    /// already at [`MAX_SKIPPED_TOTAL`]) is a hard `OutOfOrder` — it caps the
+    /// work and memory a hostile relay can force.
+    fn skip_to(&mut self, until: u32) -> Result<(), DecryptError> {
+        if until <= self.n_r {
+            return Ok(());
         }
-
-        let new_chain = self.dh_r.map_or(true, |cur| cur != dh_pub);
-        if new_chain {
-            // Peer opened a new sending chain. Validate that it continues the
-            // chain we last saw from them (`pn` = length of their previous
-            // sending chain, which we must have fully consumed).
-            if pn != self.n_r {
-                return Err(DecryptError::OutOfOrder);
-            }
-            self.ratchet(dh_pub)?;
-        } else if n != self.n_r {
-            // Same chain: messages must arrive in strict order, exactly once.
+        if until - self.n_r > MAX_SKIP {
             return Err(DecryptError::OutOfOrder);
         }
-        let ck = self.ck_r.as_ref().ok_or(DecryptError::NoState)?;
-        let (mk, next) = chain_step(ck);
-        self.ck_r = Some(next);
-        self.n_r += 1;
+        // No receiving chain open for this peer key yet (e.g. a new chain
+        // arrives before we ever received the previous one): nothing to
+        // derive, nothing to store — but the chain switch itself is fine.
+        let dh = match self.dh_r {
+            Some(d) => d,
+            None => return Ok(()),
+        };
+        let mut ck = match self.ck_r {
+            Some(c) => c,
+            None => return Ok(()),
+        };
+        while self.n_r < until {
+            let (mk, next) = chain_step(&ck);
+            if self.skipped.len() >= MAX_SKIPPED_TOTAL {
+                return Err(DecryptError::OutOfOrder);
+            }
+            self.skipped.insert((dh, self.n_r), mk);
+            ck = next;
+            self.n_r += 1;
+        }
+        self.ck_r = Some(ck);
+        Ok(())
+    }
 
-        // Try to open the AEAD with the KEM candidate secrets (newest first),
-        // then without KEM (first messages of a session, sent before the peer
-        // learned any advertised key).
+    /// Tries to open the AEAD with a message key: decapsulate the header KEM
+    /// ciphertext with our advertised KEM secrets (newest first), mixing each
+    /// candidate into the key, and fall back to no KEM (messages sent before
+    /// the peer learned any advertised key, or encapsulations to a KEM key we
+    /// rotated away — then AEAD fails).
+    fn open_aead(
+        &self,
+        header: &[u8],
+        ct: &[u8],
+        kem_ct: Option<&[u8]>,
+        mk: &[u8; 32],
+    ) -> Result<Vec<u8>, DecryptError> {
         let mut candidates: Vec<Option<Vec<u8>>> = Vec::new();
-        if let Some(kem_ct) = &kem_ct {
+        if let Some(kem_ct) = kem_ct {
             let mut any_ok = false;
             for adv in &self.kem_advertised {
                 if let Ok(ss) = kem_decapsulate(&adv.sk, kem_ct) {
@@ -472,23 +520,79 @@ impl Session {
         } else {
             candidates.push(None);
         }
-
-        let mut plaintext = None;
         for ss in candidates {
-            let final_mk = mix_kem(&mk, ss.as_deref());
-            if let Ok(pt) = aead_decrypt(
-                &self.session_id,
-                &package[..package.len() - ct.len()],
-                &final_mk,
-                ct,
-            ) {
-                plaintext = Some(pt);
-                break;
+            let final_mk = mix_kem(mk, ss.as_deref());
+            if let Ok(pt) = aead_decrypt(&self.session_id, header, &final_mk, ct) {
+                return Ok(pt);
             }
         }
-        let plaintext = plaintext.ok_or(DecryptError::AuthFailed)?;
+        Err(DecryptError::AuthFailed)
+    }
+
+    /// Decrypts a package. Ratchets state forward on new peer ratchet keys.
+    ///
+    /// Order handling: a message whose number is the expected next for its
+    /// chain decrypts in place (skipping over any gap first and retaining the
+    /// skipped message keys); a message whose key is already in the
+    /// skipped-message-key store (a straggler of the current chain or of a
+    /// chain the peer already advanced past) decrypts from the store without
+    /// touching ratchet state; anything else — duplicate, replay, or a gap
+    /// beyond [`MAX_SKIP`] — is `Err(OutOfOrder)`.
+    pub fn decrypt(&mut self, package: &[u8]) -> Result<Vec<u8>, DecryptError> {
+        let (flags, pn, n, dh_pub, kem_pk, kem_ct, rest) = parse_header(package)?;
+        let ct = rest;
+        let header = &package[..package.len() - ct.len()];
+
+        // Skipped-message-key store: a message that is not the expected next
+        // message of its chain but whose key we retained when we jumped over
+        // it. Decrypt from the store without disturbing ratchet state. The
+        // entry is removed only on a successful open, so a garbage replay
+        // cannot burn a genuine message's key.
+        let store_key = (dh_pub, n);
+        if self.skipped.contains_key(&store_key) {
+            let mk = self.skipped[&store_key];
+            let pt = self.open_aead(header, ct, kem_ct.as_deref(), &mk)?;
+            self.skipped.remove(&store_key);
+            return Ok(pt);
+        }
+
+        // Responder, very first inbound message: the header finally reveals
+        // the initiator's session-start (ephemeral) key. Derive the shared
+        // initial root + first receiving chain exactly as the initiator did.
+        if !self.initialized {
+            self.derive_initial_receive_chain(dh_pub)?;
+        }
+
+        let new_chain = self.dh_r.map_or(true, |cur| cur != dh_pub);
+        if new_chain {
+            // Peer opened a new sending chain. `pn` is the length of their
+            // previous sending chain — the chain we were receiving. It can
+            // never be smaller than what we consumed; if it is larger, the
+            // tail was lost in transit: retain its keys (stragglers will
+            // decrypt later) and ratchet.
+            if pn < self.n_r {
+                return Err(DecryptError::OutOfOrder);
+            }
+            self.skip_to(pn)?;
+            self.ratchet(dh_pub)?;
+        } else if n > self.n_r {
+            // Gap inside the current chain: derive + retain the skipped keys.
+            self.skip_to(n)?;
+        } else if n < self.n_r {
+            // Same chain, already past: either a genuine straggler (its key
+            // would have been in the store — checked above) or a replay.
+            return Err(DecryptError::OutOfOrder);
+        }
+        let ck = self.ck_r.as_ref().ok_or(DecryptError::NoState)?;
+        let (mk, next) = chain_step(ck);
+        self.ck_r = Some(next);
+        self.n_r += 1;
+
+        let plaintext = self.open_aead(header, ct, kem_ct.as_deref(), &mk)?;
 
         // Record the peer's newly advertised KEM ratchet key, if any.
+        // (Only on the in-order path — a straggler advertisement must not
+        // regress our view to an older KEM key.)
         if let Some(kem_pk) = kem_pk {
             self.kem_peer = Some(kem_pk);
         }
@@ -525,10 +629,13 @@ impl Session {
         Ok(())
     }
 
-    /// Serializes the session for encrypted persistence.
+    /// Serializes the session for encrypted persistence. The first byte is
+    /// [`SESSION_VERSION`] (0x0B); sessions written by older builds (0x0A,
+    /// without the skipped-message-key store) are accepted by `from_bytes`
+    /// with an empty store. The *wire* package version is unchanged.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        out.push(PKG_VERSION);
+        out.push(SESSION_VERSION);
         out.extend_from_slice(&self.session_id);
         out.extend_from_slice(&self.rk);
         out.extend_from_slice(&self.dh_s.0);
@@ -562,10 +669,20 @@ impl Session {
         }
         out.push(self.advertise_kem_next as u8);
         out.push(self.initialized as u8);
+        // Skipped-message-key store (0x0B only): count then (dh 32B, n u32,
+        // mk 32B) per entry.
+        out.extend_from_slice(&(self.skipped.len() as u32).to_le_bytes());
+        for ((dh, n), mk) in &self.skipped {
+            out.extend_from_slice(dh);
+            out.extend_from_slice(&n.to_le_bytes());
+            out.extend_from_slice(mk);
+        }
         out
     }
 
-    /// Restores a session from [`Session::to_bytes`].
+    /// Restores a session from [`Session::to_bytes`]. Accepts both the
+    /// current version (0x0B, with the skipped-message-key store) and the
+    /// legacy 0x0A format (empty store) so a rolling upgrade keeps sessions.
     pub fn from_bytes(data: &[u8]) -> Result<Session, String> {
         let mut p = 0usize;
         let mut take = |n: usize| -> Result<&[u8], String> {
@@ -577,7 +694,7 @@ impl Session {
             Ok(s)
         };
         let ver = take(1)?[0];
-        if ver != PKG_VERSION {
+        if ver != SESSION_VERSION && ver != PKG_VERSION {
             return Err(format!("unsupported session version {}", ver));
         }
         let arr32 = |s: &[u8]| -> Result<[u8; 32], String> {
@@ -621,6 +738,19 @@ impl Session {
         }
         let advertise_kem_next = take(1)?[0] != 0;
         let initialized = take(1)?[0] != 0;
+        let mut skipped = BTreeMap::new();
+        if ver == SESSION_VERSION {
+            let n_skip = u32::from_le_bytes(take(4)?.try_into().unwrap()) as usize;
+            if n_skip > MAX_SKIPPED_TOTAL {
+                return Err("session skipped-key count out of bounds".into());
+            }
+            for _ in 0..n_skip {
+                let dh = arr32(take(32)?)?;
+                let n = u32::from_le_bytes(take(4)?.try_into().unwrap());
+                let mk = arr32(take(32)?)?;
+                skipped.insert((dh, n), mk);
+            }
+        }
         Ok(Session {
             session_id,
             rk,
@@ -634,6 +764,7 @@ impl Session {
             kem_advertised,
             kem_peer,
             advertise_kem_next,
+            skipped,
             initialized,
         })
     }
@@ -847,15 +978,18 @@ mod tests {
         m[last] ^= 0xFF;
         assert_eq!(bob.decrypt(&m).unwrap_err(), DecryptError::AuthFailed);
 
-        // Tampering with the header (message number) must also fail loudly.
+        // Tampering with the message number in the header must also fail
+        // loudly. The second package carries n = 1; flipping the low byte
+        // makes it n = 0, which is already behind the receiving chain — a
+        // replay shape → OutOfOrder (and the AEAD would fail anyway).
         let mut m2 = alice.encrypt(b"header tamper").unwrap();
-        let hdr_n = 6; // pn field of the header
+        let hdr_n = 6; // first byte of the `n` field
         m2[hdr_n] ^= 0x01;
         assert_eq!(bob.decrypt(&m2).unwrap_err(), DecryptError::OutOfOrder);
     }
 
     #[test]
-    fn test_reordering_rejected() {
+    fn test_replay_rejected_after_consumption() {
         let (mut alice, mut bob) = fixture();
         // Establish the session with a few alternations.
         for _ in 0..3 {
@@ -993,5 +1127,159 @@ mod tests {
                 bob = Session::from_bytes(&bob.to_bytes()).unwrap();
             }
         }
+    }
+
+    // ── Skipped-message-key store (out-of-order / loss survival) ────────
+
+    /// A burst from Alice, delivered to Bob in scrambled order: every
+    /// message must decrypt, exactly once, regardless of arrival order.
+    #[test]
+    fn test_out_of_order_within_chain_recovers() {
+        let (mut alice, mut bob) = fixture();
+        let pkgs: Vec<Vec<u8>> = (0..6)
+            .map(|i| alice.encrypt(format!("reorder-{}", i).as_bytes()).unwrap())
+            .collect();
+        let mut got = Vec::new();
+        for i in [2usize, 0, 4, 1, 3, 5] {
+            got.push(bob.decrypt(&pkgs[i]).unwrap());
+        }
+        for (i, pt) in got.iter().enumerate() {
+            assert_eq!(*pt, format!("reorder-{}", [2usize, 0, 4, 1, 3, 5][i]).as_bytes());
+        }
+        // Everything was consumed exactly once: replays are all rejected.
+        for (i, pkg) in pkgs.iter().enumerate() {
+            assert_eq!(
+                bob.decrypt(pkg).unwrap_err(),
+                DecryptError::OutOfOrder,
+                "replay of message {} must be rejected",
+                i
+            );
+        }
+        // The conversation continues normally afterwards.
+        let a = alice.encrypt(b"after reorder").unwrap();
+        assert_eq!(bob.decrypt(&a).unwrap(), b"after reorder");
+    }
+
+    /// A duplicate delivery of a message that we skipped over but have not
+    /// decrypted yet must not be confused with the genuine copy: only the
+    /// authentic ciphertext opens, and the store entry survives a failed
+    /// attempt so a later genuine copy still decrypts.
+    #[test]
+    fn test_store_entry_survives_failed_open() {
+        let (mut alice, mut bob) = fixture();
+        let m0 = alice.encrypt(b"zero").unwrap();
+        let m1 = alice.encrypt(b"one").unwrap();
+        // Deliver m1 first: the engine skips over message 0, retaining its
+        // key. Then a FORGED attempt to burn message 0's key with garbage
+        // ciphertext must fail without deleting the genuine key.
+        assert_eq!(bob.decrypt(&m1).unwrap(), b"one");
+        assert_eq!(bob.skipped.len(), 1);
+        let mut forged = m0.clone();
+        let last = forged.len() - 1;
+        forged[last] ^= 0x01;
+        assert_eq!(bob.decrypt(&forged).unwrap_err(), DecryptError::AuthFailed);
+        // The genuine m0 still decrypts afterwards.
+        assert_eq!(bob.decrypt(&m0).unwrap(), b"zero");
+        assert!(bob.skipped.is_empty());
+        // And a replay of the now-consumed m0 is rejected.
+        assert_eq!(bob.decrypt(&m0).unwrap_err(), DecryptError::OutOfOrder);
+    }
+
+    /// Message keys retained by skipping must survive a serialize/restore
+    /// round-trip, and legacy 0x0A session bytes (written before the store
+    /// existed) must still load with an empty store.
+    #[test]
+    fn test_skipped_store_persists_across_restore() {
+        let (mut alice, mut bob) = fixture();
+        let m0 = alice.encrypt(b"persist-0").unwrap();
+        let m1 = alice.encrypt(b"persist-1").unwrap();
+        let m2 = alice.encrypt(b"persist-2").unwrap();
+        // m0 in order; m2 arrives next, skipping (and storing the key for) m1.
+        assert_eq!(bob.decrypt(&m0).unwrap(), b"persist-0");
+        assert_eq!(bob.decrypt(&m2).unwrap(), b"persist-2");
+        assert_eq!(bob.skipped.len(), 1);
+
+        // Restore from bytes: the stored key must survive.
+        let mut bob2 = Session::from_bytes(&bob.to_bytes()).unwrap();
+        assert_eq!(bob2.skipped.len(), 1);
+        assert_eq!(bob2.decrypt(&m1).unwrap(), b"persist-1");
+
+        // Simulate a pre-0x0B session blob: same bytes, legacy version byte
+        // and no trailing skipped section → loads with an empty store.
+        let mut legacy = bob.to_bytes();
+        let cut = legacy.len() - 4; // drop the 4-byte skipped count
+        legacy.truncate(cut);
+        legacy[0] = 0x0A;
+        let bob_legacy = Session::from_bytes(&legacy).unwrap();
+        assert!(bob_legacy.skipped.is_empty());
+
+        // A legacy-restored session keeps working in order.
+        let m3 = alice.encrypt(b"persist-3").unwrap();
+        assert_eq!(bob2.decrypt(&m3).unwrap(), b"persist-3");
+    }
+
+    /// A gap wider than `MAX_SKIP` is a hard error and must not advance the
+    /// receiving chain or store keys — the next genuine in-order message
+    /// still decrypts.
+    #[test]
+    fn test_gap_beyond_max_skip_rejected_without_state_damage() {
+        let (mut alice, mut bob) = fixture();
+        // Encrypt MAX_SKIP + 3 messages on one chain (indices/message numbers
+        // 0..=MAX_SKIP+2, so a package with number MAX_SKIP+2 exists).
+        let pkgs: Vec<Vec<u8>> = (0..MAX_SKIP + 3)
+            .map(|i| alice.encrypt(format!("bulk-{}", i).as_bytes()).unwrap())
+            .collect();
+        assert_eq!(bob.decrypt(&pkgs[0]).unwrap(), b"bulk-0");
+        // n_r = 1; message MAX_SKIP+2 opens a gap of MAX_SKIP+1 > MAX_SKIP.
+        let over = (MAX_SKIP + 2) as usize;
+        assert_eq!(
+            bob.decrypt(&pkgs[over]).unwrap_err(),
+            DecryptError::OutOfOrder
+        );
+        // No keys were stored by the rejected jump and the chain was not
+        // advanced: the very next message decrypts in order.
+        assert!(bob.skipped.is_empty());
+        assert_eq!(bob.decrypt(&pkgs[1]).unwrap(), b"bulk-1");
+    }
+
+    /// Loss + recovery across a chain switch: Alice sends three messages on
+    /// chain A1; Bob only receives the first (the other two are lost in
+    /// transit). Bob replies (opening his own chain), Alice replies, opening
+    /// chain A2 whose header reports `pn = 3` — larger than Bob's `n_r = 1`.
+    /// Bob must retain the keys for the two lost A1 messages, ratchet, and
+    /// decrypt Alice's A2 message; when the two lost A1 messages finally
+    /// arrive they decrypt from the store.
+    #[test]
+    fn test_lost_tail_across_chain_switch_recovers() {
+        let (mut alice, mut bob) = fixture();
+
+        // Alice sends 3 on chain A1; Bob receives only the first.
+        let a0 = alice.encrypt(b"a0").unwrap();
+        let a1 = alice.encrypt(b"a1").unwrap();
+        let a2 = alice.encrypt(b"a2").unwrap();
+        assert_eq!(bob.decrypt(&a0).unwrap(), b"a0"); // n_r = 1 on A1
+
+        // Bob replies (chain B1); Alice receives it (ratchets).
+        let b0 = bob.encrypt(b"b0").unwrap();
+        assert_eq!(alice.decrypt(&b0).unwrap(), b"b0");
+
+        // Alice replies → opens chain A2 (pn = 3, her A1 length).
+        let a3 = alice.encrypt(b"a3 on A2").unwrap();
+        // Bob: new chain, pn 3 > n_r 1 → retain A1 keys 1..2, ratchet, decrypt.
+        assert_eq!(bob.decrypt(&a3).unwrap(), b"a3 on A2");
+        assert_eq!(bob.skipped.len(), 2);
+
+        // The two lost A1 messages finally arrive → decrypt from the store.
+        assert_eq!(bob.decrypt(&a1).unwrap(), b"a1");
+        assert_eq!(bob.decrypt(&a2).unwrap(), b"a2");
+        assert!(bob.skipped.is_empty());
+
+        // Replays of consumed messages are rejected.
+        assert_eq!(bob.decrypt(&a0).unwrap_err(), DecryptError::OutOfOrder);
+        assert_eq!(bob.decrypt(&a1).unwrap_err(), DecryptError::OutOfOrder);
+
+        // The conversation continues on A2.
+        let a4 = alice.encrypt(b"a4").unwrap();
+        assert_eq!(bob.decrypt(&a4).unwrap(), b"a4");
     }
 }
