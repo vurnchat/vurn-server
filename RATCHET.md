@@ -261,6 +261,26 @@ a hex-added contact authenticates from its very first message. E2E
 re-run with fresh profiles: all 14 checks pass, including the
 "no ⚠ unverified marker" assertions on both the init and the
 continuation. Both clients must update together.
+Stage F: **DONE.** Signed-prekey rotation (core + web, deployed). Core
+0.10.0 adds `rotate_signed_prekey` (fresh KEM+X25519 prekey bound to the
+unchanged identity signing key, returns the new bundle + secret halves)
+and `IdentityBundle::same_identity` (identical `ik_kem`/`ik_x`/`sig_pk`,
+prekey excluded). The web client keeps one *previous* prekey generation
+in the vault and a `spk_created_at` timestamp; the profile modal has a
+"Rotate prekey" action that persists the new prekey and re-publishes
+the profile via the server's update opcode (0x04), with auto-rotation on
+connect when the prekey is older than 30 days. Init handling is
+rotation-aware: a fresh init is accepted when the envelope bundle is the
+*same identity* with a different (rotated) prekey, refreshing the
+stored contact copy (`apply_bundle_update`), and responder bootstrap
+falls back to the retained previous prekey when the init was
+encapsulated to the retired one. Rotation never disturbs established
+sessions (the engine replaces its DH key with a fresh per-chain
+keypair after bootstrap). E2E with fresh profiles: all 26 checks pass,
+including rotate + server ack, continuations across rotation,
+re-init against the stale cached bundle (previous-prekey fallback), and
+fresh-init acceptance with bundle refresh — no impersonation rejects,
+no ⚠ markers.
 
 ## 8. Wire/API surface changes (for Stage C)
 
