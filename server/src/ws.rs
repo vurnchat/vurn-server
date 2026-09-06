@@ -809,3 +809,134 @@ pub fn hex_fmt(bytes: &[u8], max: usize) -> String {
         format!("{s}({}b)", bytes.len())
     }
 }
+
+#[cfg(test)]
+mod update_token_tests {
+    use super::*;
+
+    /// Runs a fake DHT store for the handlers: applies Profile(Store|Token)
+    /// writes and answers lookups from HashMaps, mirroring the record
+    /// semantics the real node provides.
+    async fn spawn_fake_dht() -> mpsc::Sender<NodeCommand> {
+        let (tx, mut rx) = mpsc::channel(16);
+        tokio::spawn(async move {
+            let mut blobs: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+            let mut tokens: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+            while let Some(cmd) = rx.recv().await {
+                match cmd {
+                    NodeCommand::ProfileStore { index, blob } => {
+                        blobs.insert(index, blob);
+                    }
+                    NodeCommand::ProfileTokenStore { index, token } => {
+                        tokens.insert(index, token);
+                    }
+                    NodeCommand::ProfileLookup { index, resp } => {
+                        let _ = resp.send(blobs.get(&index).cloned());
+                    }
+                    NodeCommand::ProfileTokenLookup { index, resp } => {
+                        let _ = resp.send(tokens.get(&index).cloned());
+                    }
+                    _ => {}
+                }
+            }
+        });
+        tx
+    }
+
+    fn test_state(cmd_tx: mpsc::Sender<NodeCommand>) -> SharedState {
+        let mut inner = GatewayStateInner::default();
+        inner.p2p_cmd_tx = Some(cmd_tx);
+        Arc::new(RwLock::new(inner))
+    }
+
+    /// The core Finding-#2 property: an attacker who knows only the username
+    /// (and therefore the publicly derivable search index) cannot overwrite a
+    /// profile. Registration mints a token; updates require it; re-registering
+    /// a tokenized username is refused.
+    #[tokio::test]
+    async fn update_requires_registration_token() {
+        let cmd_tx = spawn_fake_dht().await;
+        let state = test_state(cmd_tx);
+
+        // A deterministic "public" index (username-derived, keyless HMAC).
+        let index: Vec<u8> = (0..32).map(|i| i as u8).collect();
+        let mut reg = Vec::new();
+        reg.extend_from_slice(&index);
+        reg.extend_from_slice(b"first profile blob");
+
+        // Registration succeeds and returns the freshly minted 32-byte token.
+        let resp = handle_register_profile(&state, b"owner", &reg).await.unwrap();
+        assert_eq!(&resp[..3], &PROFILE_SUCCESS[..]);
+        assert_eq!(resp.len(), 3 + 32);
+        let token = resp[3..].to_vec();
+
+        // Attacker guesses the token → overwrite rejected.
+        let mut evil = Vec::new();
+        evil.extend_from_slice(&index);
+        evil.extend_from_slice(&[0xAB; 32]);
+        evil.extend_from_slice(b"attacker bundle");
+        assert_eq!(handle_update_profile(&state, &evil).await.unwrap(), vec![0xFF, 0x03, 0x01]);
+
+        // Owner updates with the real token → accepted.
+        let mut good = Vec::new();
+        good.extend_from_slice(&index);
+        good.extend_from_slice(&token);
+        good.extend_from_slice(b"owner's rotated bundle");
+        assert_eq!(handle_update_profile(&state, &good).await.unwrap(), vec![0xFE, 0x03, 0x00]);
+
+        // Re-registering the now-tokenized username is refused (occupied).
+        let resp = handle_register_profile(&state, b"attacker", &reg).await.unwrap();
+        assert_eq!(resp, PROFILE_OCCUPIED.to_vec());
+    }
+
+    /// Updating a username with no token on record (legacy, or nonexistent)
+    /// is rejected with the re-register hint.
+    #[tokio::test]
+    async fn update_rejected_when_no_token_on_record() {
+        let cmd_tx = spawn_fake_dht().await;
+        let state = test_state(cmd_tx);
+
+        let index: Vec<u8> = (0..32).map(|i| (i as u8).wrapping_mul(3)).collect();
+        let mut evil = Vec::new();
+        evil.extend_from_slice(&index);
+        evil.extend_from_slice(&[0u8; 32]);
+        evil.extend_from_slice(b"blob");
+        assert_eq!(handle_update_profile(&state, &evil).await.unwrap(), vec![0xFF, 0x03, 0x02]);
+    }
+
+    /// Legacy migration: a profile that exists without a token is reclaimable
+    /// via registration, which mints a token and closes the hole from then on.
+    #[tokio::test]
+    async fn legacy_profile_reclaim_mints_token() {
+        let cmd_tx = spawn_fake_dht().await;
+        let state = test_state(cmd_tx.clone());
+
+        // A pre-token profile: blob record present, no vut_ record.
+        let index: Vec<u8> = (0..32).map(|i| (i as u8).wrapping_mul(5)).collect();
+        cmd_tx
+            .send(NodeCommand::ProfileStore {
+                index: index.clone(),
+                blob: b"legacy blob".to_vec(),
+            })
+            .await
+            .unwrap();
+
+        // Re-registration of a legacy profile succeeds and mints a token.
+        let mut reg = Vec::new();
+        reg.extend_from_slice(&index);
+        reg.extend_from_slice(b"reclaimed blob");
+        let resp = handle_register_profile(&state, b"owner", &reg).await.unwrap();
+        assert_eq!(&resp[..3], &PROFILE_SUCCESS[..]);
+        assert_eq!(resp.len(), 3 + 32);
+        let token = resp[3..].to_vec();
+
+        // From now on the token gates updates.
+        let mut upd = Vec::new();
+        upd.extend_from_slice(&index);
+        upd.extend_from_slice(&[0x11; 32]);
+        upd.extend_from_slice(b"attacker");
+        assert_eq!(handle_update_profile(&state, &upd).await.unwrap(), vec![0xFF, 0x03, 0x01]);
+        upd[32..64].copy_from_slice(&token);
+        assert_eq!(handle_update_profile(&state, &upd).await.unwrap(), vec![0xFE, 0x03, 0x00]);
+    }
+}
