@@ -193,6 +193,19 @@ Single-device profile keeps this manageable.
 - PCS: a fresh DH ratchet + fresh ML-KEM ratchet keys are introduced on
   every peer chain open; after one honest round-trip a compromise is
   sealed.
+- Sender authentication (per-message): the ratchet AEAD authenticates the
+  *session* — it proves the ciphertext was produced by a holder of the
+  shared chain state, which is exactly what both parties (or a thief of
+  either side's persisted session) possess. Every message therefore also
+  carries, **inside** the ratchet ciphertext, an ML-DSA-87 signature by the
+  sender's *long-term identity key* over the plaintext (the same envelope
+  the v0.7 static path used), and the receiver verifies it against the
+  pinned contact key (`Contact.signing_public_key`) before displaying.
+  Possession of session state — even a full session-state theft — is
+  therefore never sufficient to forge a message as the contact; only the
+  sender's ML-DSA secret can sign one. Messages whose signature fails are
+  rejected as a possible spoof; unsigned payloads (pre-signature clients)
+  degrade to an explicit unverified marker instead of being trusted.
 - What this does NOT provide (unchanged): metadata privacy (relay sees the
   social graph, sizes, timing); server-side usernames are dictionary-
   attackable; no deniability layer; compromise of the local encrypted vault
@@ -236,6 +249,18 @@ the established session, and a reload mid-conversation proving session
 state persists in encrypted IndexedDB. Both clients must update
 together; existing profiles need a one-time reset + username
 re-registration.
+Stage E: **DONE.** Per-message sender authentication on the ratchet path
+(web client, deployed to `vurn-web.pages.dev`). `ratchet_send` now signs
+the plaintext with the sender's long-term ML-DSA key (`sign_message`)
+*before* ratchet encryption; on receive the decrypted envelope is
+verified via `decode_incoming`/`decode_signed` against the stored
+contact key for continuations and against the init envelope's own
+`sig_pk` for the first message. Signature failures are rejected as
+possible spoofs; TOFU bundle adoption now pins the adopted `sig_pk` so
+a hex-added contact authenticates from its very first message. E2E
+re-run with fresh profiles: all 14 checks pass, including the
+"no ⚠ unverified marker" assertions on both the init and the
+continuation. Both clients must update together.
 
 ## 8. Wire/API surface changes (for Stage C)
 
