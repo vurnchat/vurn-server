@@ -107,6 +107,13 @@ pub enum NodeCommand {
         index: Vec<u8>,
         resp: oneshot::Sender<Option<Vec<u8>>>,
     },
+    /// Store a profile's update token in DHT (vut_<search_index>).
+    ProfileTokenStore { index: Vec<u8>, token: Vec<u8> },
+    /// Look up a profile's update token in DHT. Response via oneshot.
+    ProfileTokenLookup {
+        index: Vec<u8>,
+        resp: oneshot::Sender<Option<Vec<u8>>>,
+    },
 }
 
 // ── Pending command (for speculative FetchingIndex) ─────────────────
@@ -503,8 +510,10 @@ async fn handle_kad_event(
                         let key = peer_record.record.key.to_vec();
                         let value = Some(peer_record.record.value.clone());
 
-                        // Check for pending profile lookup first (vup_ prefix)
-                        if dht::parse_profile_key(&key).is_some() {
+                        // Check for pending profile lookup first (vup_/vut_ prefixes)
+                        if dht::parse_profile_key(&key).is_some()
+                            || dht::parse_update_key(&key).is_some()
+                        {
                             if let Some(resp) = pending_profile_queries.remove(&id) {
                                 let _ = resp.send(value);
                             }
@@ -1050,6 +1059,26 @@ async fn handle_command(
             let qid = kademlia.get_record(key);
             pending_profile_queries.insert(qid, resp);
             info!("ProfileLookup: querying DHT for index {}", hex_fmt(&index, 8));
+            mailbox_state
+        }
+        NodeCommand::ProfileTokenStore { index, token } => {
+            let key = dht::update_key(&index);
+            use kad::Record;
+            let record = Record {
+                key,
+                value: token,
+                publisher: None,
+                expires: None,
+            };
+            let _ = kademlia.put_record(record, kad::Quorum::Majority);
+            info!("ProfileTokenStore: stored update token for index {}", hex_fmt(&index, 8));
+            mailbox_state
+        }
+        NodeCommand::ProfileTokenLookup { index, resp } => {
+            let key = dht::update_key(&index);
+            let qid = kademlia.get_record(key);
+            pending_profile_queries.insert(qid, resp);
+            info!("ProfileTokenLookup: querying DHT for index {}", hex_fmt(&index, 8));
             mailbox_state
         }
 

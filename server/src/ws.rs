@@ -590,9 +590,41 @@ async fn handle_profile_operation(
     }
 }
 
+/// Looks up a profile's stored update token (vut_ record). `None` means the
+/// profile predates update tokens (legacy) or does not exist.
+async fn lookup_update_token(
+    cmd_tx: &mpsc::Sender<NodeCommand>,
+    index: &[u8],
+) -> Option<Vec<u8>> {
+    let (tx, rx) = oneshot::channel();
+    if cmd_tx
+        .send(NodeCommand::ProfileTokenLookup {
+            index: index.to_vec(),
+            resp: tx,
+        })
+        .await
+        .is_err()
+    {
+        return None;
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
+        Ok(Ok(tok)) => tok,
+        _ => None,
+    }
+}
+
 /// Register a blind username in the DHT.
 /// 1. First queries DHT to check if the search_index is already taken
 /// 2. If free, stores the encrypted blob in DHT via ProfileStore
+/// 3. Mints a random 32-byte update token (stored at `vut_<index>`) and
+///    returns it in the success response — every later profile *update*
+///    must present this token (see [`handle_update_profile`]).
+///
+/// Legacy migration: a profile that exists but has **no** update token
+/// predates this feature and is *reclaimable* — registering the same
+/// username again overwrites it and mints a fresh token. That keeps the
+/// pre-token overwrite hole from becoming a permanent lock-out; tokenized
+/// profiles can never be re-registered or overwritten without the token.
 async fn handle_register_profile(
     state: &SharedState,
     _owner_id: &[u8],
@@ -625,16 +657,39 @@ async fn handle_register_profile(
     };
 
     if existing.is_some() {
-        info!("Profile occupied: index {}", hex_fmt(&index, 8));
-        return Some(PROFILE_OCCUPIED.to_vec());
+        // Taken: allow re-registration only when the existing profile is
+        // legacy (no update token). A tokenized profile is immutable
+        // without its token — that is the point of the token.
+        let tok = lookup_update_token(&cmd_tx, &index).await;
+        if tok.is_some() {
+            info!("Profile occupied (tokenized): index {}", hex_fmt(&index, 8));
+            return Some(PROFILE_OCCUPIED.to_vec());
+        }
+        info!(
+            "Profile occupied but legacy (no update token) — reclaiming index {}",
+            hex_fmt(&index, 8)
+        );
     }
 
-    // Step 2: Store in DHT
-    if cmd_tx.send(NodeCommand::ProfileStore { index, blob }).await.is_err() {
+    // Step 2: mint the update token and store blob + token
+    let token: [u8; 32] = rand::random();
+    if cmd_tx.send(NodeCommand::ProfileStore { index: index.clone(), blob }).await.is_err() {
+        return None;
+    }
+    if cmd_tx
+        .send(NodeCommand::ProfileTokenStore {
+            index: index.clone(),
+            token: token.to_vec(),
+        })
+        .await
+        .is_err()
+    {
         return None;
     }
 
-    Some(PROFILE_SUCCESS.to_vec())
+    let mut resp = PROFILE_SUCCESS.to_vec();
+    resp.extend_from_slice(&token);
+    Some(resp)
 }
 
 /// Look up a blind username in the DHT.
@@ -686,18 +741,24 @@ async fn handle_unregister_profile(
     Some(vec![0xFF, 0x02, 0x00])
 }
 
-/// Update profile by overwriting the DHT entry.
-/// Anyone who knows the search_index can overwrite, which is acceptable
-/// since the blob is AES-GCM encrypted with a key derived from the username.
+/// Update a profile by overwriting the DHT entry. The request must present
+/// the profile's update token (`[index 32B][token 32B][blob]`); without a
+/// matching token the overwrite is rejected. This closes the previous hole
+/// where anyone who knew the (publicly derivable) search_index could replace
+/// a profile with their own bundle.
+///
+/// Responses: `[0xFE,0x03,0x00]` success, `[0xFF,0x03,0x01]` bad token,
+/// `[0xFF,0x03,0x02]` no token on record (legacy profile — re-register).
 async fn handle_update_profile(
     state: &SharedState,
     payload: &[u8],
 ) -> Option<Vec<u8>> {
-    if payload.len() < 32 {
+    if payload.len() < 32 + 32 {
         return None;
     }
     let index = payload[..32].to_vec();
-    let new_blob = payload[32..].to_vec();
+    let presented = &payload[32..64];
+    let new_blob = payload[64..].to_vec();
     if new_blob.is_empty() {
         return None;
     }
@@ -708,11 +769,33 @@ async fn handle_update_profile(
     };
     let cmd_tx = cmd_tx?;
 
-    if cmd_tx.send(NodeCommand::ProfileStore { index, blob: new_blob }).await.is_err() {
-        return None;
+    let stored = lookup_update_token(&cmd_tx, &index).await;
+    match stored {
+        None => {
+            warn!(
+                "Update rejected: no update token on record for index {}",
+                hex_fmt(&index, 8)
+            );
+            Some(vec![0xFF, 0x03, 0x02])
+        }
+        Some(tok) if tok != presented => {
+            warn!(
+                "Update rejected: bad update token for index {}",
+                hex_fmt(&index, 8)
+            );
+            Some(vec![0xFF, 0x03, 0x01])
+        }
+        Some(_) => {
+            if cmd_tx
+                .send(NodeCommand::ProfileStore { index, blob: new_blob })
+                .await
+                .is_err()
+            {
+                return None;
+            }
+            Some(vec![0xFE, 0x03, 0x00])
+        }
     }
-
-    Some(vec![0xFE, 0x03, 0x00])
 }
 
 // ── Helper ──────────────────────────────────────────────────────────

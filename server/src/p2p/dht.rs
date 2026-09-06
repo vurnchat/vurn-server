@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 
 const MAILBOX_KEY_PREFIX: &[u8] = b"vmb_";
 const PROFILE_KEY_PREFIX: &[u8] = b"vup_";
+const UPDATE_KEY_PREFIX: &[u8] = b"vut_";
 
 /// Cryptographically signed envelope stored in the DHT.
 ///
@@ -120,6 +121,28 @@ pub fn profile_key(search_index: &[u8]) -> RecordKey {
 /// Format: `vup_<search_index>` — returns the `<search_index>` portion.
 pub fn parse_profile_key(key: &[u8]) -> Option<Vec<u8>> {
     if !key.starts_with(PROFILE_KEY_PREFIX) {
+        return None;
+    }
+    Some(key[4..].to_vec())
+}
+
+/// DHT key for a profile's update token.
+/// Format: `vut_<search_index>`. Issued at registration and stored
+/// server-side next to the profile blob (`vup_<search_index>`); the lookup
+/// path never serves it, and an update (profile overwrite) must present it —
+/// closing the unauthenticated overwrite hole. Same persistence as the
+/// profile blob (Kademlia record), so tokens survive restarts.
+pub fn update_key(search_index: &[u8]) -> RecordKey {
+    let mut key = Vec::with_capacity(4 + search_index.len());
+    key.extend_from_slice(UPDATE_KEY_PREFIX);
+    key.extend_from_slice(search_index);
+    RecordKey::new(&key)
+}
+
+/// Extract the search index from an update-token key.
+/// Format: `vut_<search_index>` — returns the `<search_index>` portion.
+pub fn parse_update_key(key: &[u8]) -> Option<Vec<u8>> {
+    if !key.starts_with(UPDATE_KEY_PREFIX) {
         return None;
     }
     Some(key[4..].to_vec())
