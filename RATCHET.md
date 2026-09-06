@@ -233,6 +233,11 @@ Single-device profile keeps this manageable.
   social graph, sizes, timing); server-side usernames are dictionary-
   attackable; no deniability layer; compromise of the local encrypted vault
   exposes everything in it at that moment (standard for single-device).
+- Profile overwrite (Stage H): registration mints a server-side update
+  token that every profile update must present, so a username can no longer
+  be hijacked by anyone who merely knows it — except pre-token (legacy)
+  profiles, which stay reclaimable via re-registration until their owner
+  claims a token. Losing the token means re-registering the username.
 
 ## 7. Staged implementation plan
 
@@ -316,13 +321,38 @@ when the envelope bundle is the *same identity* with a different
 (`apply_bundle_update`), and responder bootstrap falls back through the
 two retained previous generations (current → prev → prev2) when the init
 was encapsulated to a retired prekey. Rotation never disturbs
-established sessions (the engine replaces its DH key with a fresh
-per-chain keypair after bootstrap). E2E with fresh profiles: all 29
+establishedsessions (the engine replaces its DH key with a fresh per-chain
+keypair after bootstrap). E2E with fresh profiles: all 29
 checks pass, including rotate + server ack twice, continuations across
 rotation, re-init against the stale cached bundle after one rotation
 (prev fallback) and after two rotations (prev2 fallback), and
 fresh-init acceptance with bundle refresh — no impersonation rejects,
 no ⚠ markers.
+Stage H: **DONE.** Profile-overwrite protection (server v0.7.0 + web
+v0.1.3, deployed). The update opcode (0x04) previously overwrote a
+profile on presentation of its search index alone — and the index is an
+*unkeyed* HMAC of the username, so anyone who knew the username could
+replace the profile with their own bundle (username DoS, impersonation
+toward new contacts) and the 30-day auto-rotation depended on that same
+opcode. Registration now mints a random 32-byte update token stored
+server-side in a `vut_<index>` DHT record (same persistence as the
+profile blob, never served by the lookup path) and returned to the
+client once in the success response; every update must present it
+(`[index][token][blob]`) or is rejected (`0xFF,0x03,0x01` bad token /
+`0xFF,0x03,0x02` no token on record). The client persists the token in
+the vault and sends it on rotation re-publish; without one it rotates
+locally and asks the user to re-register. Migration: profiles that
+predate the token have no `vut_` record and are reclaimable by
+re-registration (no worse than before the fix, and the hole closes for
+everything registered from now on); a tokenized profile cannot be
+re-registered or overwritten without its token, so a lost token means
+re-registering the username. Lookup stays fully blind — the server
+still never learns the username or the token's owner. E2E (fresh
+accounts, token-gated rotate): all 29 checks pass; 3 new server unit
+tests assert the gate (wrong token rejected, unknown username rejected,
+owner update accepted, tokenized re-register refused, legacy reclaim
+mints a working token).
+
 
 ## 8. Wire/API surface changes (for Stage C)
 
