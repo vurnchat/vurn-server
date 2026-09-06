@@ -32,8 +32,10 @@ A user's profile/invite/contact payload carries, in one sealed blob:
 | `spk_sig` | ML-DSA-87 signature over `spk_kem ‖ spk_x` by the identity ML-DSA key | binds prekey to identity |
 
 The client keeps the corresponding secret keys; the signed-prekey secret
-pair is replaced on each re-registration and old prekey secrets are deleted
-once all sessions that used them are closed or the prekey rotates.
+pair is replaced on each rotation, with the **two most recent retired
+generations retained** as a decapsulation fallback for inits that were
+encapsulated to them (peers whose cached bundle is up to two rotations
+old).
 
 Identity session id stays `SHA-256(ik_kem)` so relay routing / mailbox
 grouping is unchanged.
@@ -108,10 +110,13 @@ ratchet state. When a peer opens a new chain whose `pn` exceeds what we
 consumed of its predecessor (loss), the missing tail's keys are retained
 before the DH ratchet, so stragglers still decrypt. A number that is
 neither next-in-chain nor in the store stays a hard `OutOfOrder`
-(duplicate/replay/oversized gap). Store entries are deleted only after a
-successful AEAD open and serialize with the session state (session format
-0x0B; 0x0A blobs still load with an empty store, the wire format is
-unchanged).
+(duplicate/replay/oversized gap). A gap that would push the store past
+its cap is rejected **up front, atomically** — no keys inserted, no
+counter advanced — so an over-capacity rejection can never leave the
+receiving chain partially advanced (core 0.12.0). Store entries are
+deleted only after a successful AEAD open and serialize with the session
+state (session format 0x0B; 0x0A blobs still load with an empty store,
+the wire format is unchanged).
 
 ## 4. Message flow (double ratchet, DH + KEM mixing)
 
@@ -288,28 +293,34 @@ messages decrypt from the store without disturbing ratchet state.
 Entries are deleted only after a successful AEAD open (a forged replay
 cannot burn a genuine key) and serialize with the session (state format
 0x0B; 0x0A blobs load with an empty store, wire format unchanged, so
-clients do not need to be co-deployed for this stage). 63 core tests
-green, including scrambled within-chain delivery, forged-open survival,
-store persistence across serialize/restore, an over-MAX_SKIP gap that
-must not damage chain state, and lost-tail-across-chain-switch recovery.
+clients do not need to be co-deployed for this stage). Core 0.12.0
+makes the capacity bound atomic: a gap that would overflow the store is
+rejected before any state changes (no partial advance of `n_r`). 64
+core tests green, including scrambled within-chain delivery, forged-open
+survival, store persistence across serialize/restore, an over-MAX_SKIP
+gap and a store-capacity overflow that must not damage chain state, and
+lost-tail-across-chain-switch recovery.
 Stage F: **DONE.** Signed-prekey rotation (core + web, deployed). Core
 0.10.0 adds `rotate_signed_prekey` (fresh KEM+X25519 prekey bound to the
 unchanged identity signing key, returns the new bundle + secret halves)
 and `IdentityBundle::same_identity` (identical `ik_kem`/`ik_x`/`sig_pk`,
-prekey excluded). The web client keeps one *previous* prekey generation
-in the vault and a `spk_created_at` timestamp; the profile modal has a
-"Rotate prekey" action that persists the new prekey and re-publishes
-the profile via the server's update opcode (0x04), with auto-rotation on
-connect when the prekey is older than 30 days. Init handling is
-rotation-aware: a fresh init is accepted when the envelope bundle is the
-*same identity* with a different (rotated) prekey, refreshing the
-stored contact copy (`apply_bundle_update`), and responder bootstrap
-falls back to the retained previous prekey when the init was
-encapsulated to the retired one. Rotation never disturbs established
-sessions (the engine replaces its DH key with a fresh per-chain
-keypair after bootstrap). E2E with fresh profiles: all 26 checks pass,
-including rotate + server ack, continuations across rotation,
-re-init against the stale cached bundle (previous-prekey fallback), and
+prekey excluded). The web client keeps **two** *previous* prekey
+generations in the vault (current + two retired: rotation moves the
+current into `prev` and `prev` into `prev2`) and a `spk_created_at`
+timestamp; the profile modal has a "Rotate prekey" action that persists
+the new prekey and re-publishes the profile via the server's update
+opcode (0x04), with auto-rotation on connect when the prekey is older
+than 30 days. Init handling is rotation-aware: a fresh init is accepted
+when the envelope bundle is the *same identity* with a different
+(rotated) prekey, refreshing the stored contact copy
+(`apply_bundle_update`), and responder bootstrap falls back through the
+two retained previous generations (current → prev → prev2) when the init
+was encapsulated to a retired prekey. Rotation never disturbs
+established sessions (the engine replaces its DH key with a fresh
+per-chain keypair after bootstrap). E2E with fresh profiles: all 29
+checks pass, including rotate + server ack twice, continuations across
+rotation, re-init against the stale cached bundle after one rotation
+(prev fallback) and after two rotations (prev2 fallback), and
 fresh-init acceptance with bundle refresh — no impersonation rejects,
 no ⚠ markers.
 
